@@ -1219,6 +1219,9 @@ class TaskWorker(
                     PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
                 builder.setContentIntent(tapPendingIntent)
+                Log.v(BackgroundDownloaderPlugin.TAG, "taptap set tapIntent ${tapPendingIntent}")
+            } else {
+                Log.v(BackgroundDownloaderPlugin.TAG, "taptap tapIntent == null for package ${applicationContext.packageName}")
             }
             // add buttons depending on notificationType
             when (notificationType) {

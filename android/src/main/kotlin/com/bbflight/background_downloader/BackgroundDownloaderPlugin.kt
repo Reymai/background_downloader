@@ -605,6 +605,7 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
      * its listener may not have been initialized yet. This function therefore includes retry logic.
      */
     private fun handleIntent(intent: Intent?): Boolean {
+        Log.v(TAG, "taptap handleIntent")
         if (intent != null && intent.action == NotificationRcvr.actionTap) {
             val taskJsonMapString =
                 intent.extras?.getString(NotificationRcvr.bundleTask)
@@ -616,6 +617,7 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
                 while (retries < 5 && !success) {
                     try {
                         if (backgroundChannel != null && scope != null) {
+                            Log.v(TAG, "taptap handleIntent send background message $retries")
                             val resultCompleter = CompletableFuture<Boolean>()
                             val resultHandler = ResultHandler(resultCompleter)
                             scope?.launch {
@@ -626,11 +628,13 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
                                 )
                             }
                             success = resultCompleter.join()
+                            Log.v(TAG, "taptap handleIntent background message $success")
                         }
                     } catch (e: Exception) {
                         Log.v(TAG, "Exception in handleIntent: $e")
                     }
                     if (!success) {
+                        Log.v(TAG, "taptap handleIntent failed background message $retries")
                         delay(timeMillis = 100 * 2.0.pow(retries).toLong())
                         retries++
                     }

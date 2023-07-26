@@ -86,6 +86,7 @@ final class NativeDownloader extends BaseDownloader {
           setResumeData(ResumeData(task, tempFilename, requiredStartByte));
 
         case ('notificationTap', int notificationTypeOrdinal):
+          debugPrint('taptap received notificationTap message');
           final notificationType =
               NotificationType.values[notificationTypeOrdinal];
           processNotificationTap(task, notificationType);
@@ -95,6 +96,7 @@ final class NativeDownloader extends BaseDownloader {
           throw StateError('Background channel: no match for message $message');
       }
     });
+    debugPrint('taptap have set background channel listener');
   }
 
   @override
