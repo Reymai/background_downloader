@@ -483,7 +483,7 @@ abstract base class BaseDownloader {
         notificationTapCallback(task, notificationType);
         success = true;
       } else {
-        log.fine('taptap no callback found);
+        log.fine('taptap no callback found');
         await Future.delayed(
             Duration(milliseconds: 100 * pow(2, retries).round()));
         retries++;
