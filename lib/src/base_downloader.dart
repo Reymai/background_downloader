@@ -474,16 +474,17 @@ abstract base class BaseDownloader {
   /// allow a few retries with backoff to let the app register a callback
   Future<void> processNotificationTap(
       Task task, NotificationType notificationType) async {
-    log.fine('taptap task.group=${task.group} and callbacks are: $groupNotificationTapCallbacks');
+    debugPrint('taptap task.group=${task.group} and callbacks are: $groupNotificationTapCallbacks');
     var retries = 0;
     var success = false;
     while (retries < 5 && !success) {
       final notificationTapCallback = groupNotificationTapCallbacks[task.group];
       if (notificationTapCallback != null) {
+        debugPrint('calling your callback $notificationTapCallback');
         notificationTapCallback(task, notificationType);
         success = true;
       } else {
-        log.fine('taptap no callback found');
+        debugPrint('taptap no callback found');
         await Future.delayed(
             Duration(milliseconds: 100 * pow(2, retries).round()));
         retries++;
