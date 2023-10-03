@@ -8,9 +8,9 @@ import 'package:mime/mime.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
-import 'web_downloader.dart' if (dart.library.io) 'desktop_downloader.dart';
 import 'exceptions.dart';
 import 'file_downloader.dart';
+import 'web_downloader.dart' if (dart.library.io) 'desktop_downloader.dart';
 
 final _log = Logger('FileDownloader');
 
@@ -102,7 +102,11 @@ enum BaseDirectory {
   /// As returned by getApplicationLibrary() on iOS. For other platforms
   /// this resolves to the subdirectory 'Library' created in the directory
   /// returned by getApplicationSupportDirectory()
-  applicationLibrary
+  applicationLibrary,
+
+  /// As returned by get getDownloadsDirectory() for Android, and by get
+  /// getApplicationSupportDirectory() for iOS
+  downloads
 }
 
 /// Type of updates requested for a task or group of tasks
@@ -376,6 +380,13 @@ sealed class Task extends Request {
     if (this is MultiUploadTask && withFilename == null) {
       return '';
     }
+
+    Directory? downloadDirectory;
+    if (baseDirectory == BaseDirectory.downloads) {
+      downloadDirectory = (await getExternalStorageDirectories(
+              type: StorageDirectory.downloads))!
+          .first;
+    }
     final Directory baseDir = await switch (baseDirectory) {
       BaseDirectory.applicationDocuments => getApplicationDocumentsDirectory(),
       BaseDirectory.temporary => getTemporaryDirectory(),
@@ -384,7 +395,8 @@ sealed class Task extends Request {
           when Platform.isMacOS || Platform.isIOS =>
         getLibraryDirectory(),
       BaseDirectory.applicationLibrary => Future.value(Directory(
-          path.join((await getApplicationSupportDirectory()).path, 'Library')))
+          path.join((await getApplicationSupportDirectory()).path, 'Library'))),
+      BaseDirectory.downloads => Future.value(downloadDirectory),
     };
     return path.join(baseDir.path, directory, withFilename ?? filename);
   }

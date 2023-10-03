@@ -4,9 +4,8 @@ import 'dart:io';
 
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as path;
-import 'package:sqflite/sqflite.dart' as sql;
-
 import 'package:path_provider/path_provider.dart';
+import 'package:sqflite/sqflite.dart' as sql;
 
 import 'database.dart';
 import 'models.dart';
@@ -327,6 +326,7 @@ abstract class FlutterDownloaderPersistentStorage implements PersistentStorage {
   late final Directory supportDir;
   late final Directory tempDir;
   late final Directory libraryDir;
+  late final Directory downloadsDir;
 
   /// Return the path to the SQLite database
   Future<String> getDatabasePath();
@@ -357,13 +357,15 @@ abstract class FlutterDownloaderPersistentStorage implements PersistentStorage {
                 tempDir: BaseDirectory.temporary,
                 supportDir: BaseDirectory.applicationSupport,
                 libraryDir: BaseDirectory.applicationLibrary,
-                docsDir: BaseDirectory.applicationDocuments
+                docsDir: BaseDirectory.applicationDocuments,
+                downloadsDir: BaseDirectory.downloads
               }
             : {
                 tempDir: BaseDirectory.temporary,
                 libraryDir: BaseDirectory.applicationLibrary,
                 supportDir: BaseDirectory.applicationSupport,
-                docsDir: BaseDirectory.applicationDocuments
+                docsDir: BaseDirectory.applicationDocuments,
+                downloadsDir: BaseDirectory.downloads
               });
     for (final dir in directories.keys) {
       final (match, subDir) = _contains(dir, savedDir);
@@ -423,6 +425,9 @@ abstract class FlutterDownloaderPersistentStorage implements PersistentStorage {
     libraryDir = Platform.isIOS
         ? await getLibraryDirectory()
         : Directory(path.join(supportDir.path, 'Library'));
+    downloadsDir = (Platform.isAndroid
+        ? Directory('/storage/emulated/0/Download')
+        : await getApplicationSupportDirectory());
     final dbPath = await getDatabasePath();
     if (await File(dbPath).exists()) {
       // only open the database if it already exists - we don't create it

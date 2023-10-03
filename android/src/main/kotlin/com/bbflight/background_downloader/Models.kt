@@ -4,6 +4,7 @@ package com.bbflight.background_downloader
 
 import android.content.Context
 import android.os.Build
+import android.os.Environment
 import com.bbflight.background_downloader.BackgroundDownloaderPlugin.Companion.gson
 import java.io.File
 import kotlin.io.path.Path
@@ -18,7 +19,8 @@ enum class BaseDirectory {
     applicationDocuments,  // getApplicationDocumentsDirectory()
     temporary,  // getTemporaryDirectory()
     applicationSupport, // getApplicationSupportDirectory()
-    applicationLibrary // getApplicationSupportDirectory() subdir "Library"
+    applicationLibrary, // getApplicationSupportDirectory() subdir "Library"
+    downloads // getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
 }
 
 /// Type of updates requested for a group of tasks
@@ -157,6 +159,7 @@ class Task(
                 BaseDirectory.applicationLibrary -> Path(
                     context.filesDir.path, "Library"
                 ).pathString
+                BaseDirectory.downloads -> "/storage/emulated/0/Download"
             }
             val path = Path(baseDirPath, directory)
             return Path(path.pathString, filenameToUse).pathString
@@ -166,6 +169,7 @@ class Task(
                 BaseDirectory.temporary -> context.cacheDir.path
                 BaseDirectory.applicationSupport -> context.filesDir.path
                 BaseDirectory.applicationLibrary -> "${context.filesDir.path}/Library"
+                BaseDirectory.downloads -> "/storage/emulated/0/Download"
             }
             return if (directory.isEmpty()) "$baseDirPath/${filenameToUse}" else
                 "$baseDirPath/${directory}/${filenameToUse}"

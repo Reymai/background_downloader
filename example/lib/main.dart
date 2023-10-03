@@ -225,7 +225,7 @@ class _MyAppState extends State<MyApp> {
                 : 'https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP',
             filename: 'zipfile.zip',
             directory: 'my/directory',
-            baseDirectory: BaseDirectory.applicationDocuments,
+            baseDirectory: BaseDirectory.downloads,
             updates: Updates.statusAndProgress,
             allowPause: true,
             metaData: '<example metaData>');
