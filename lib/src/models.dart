@@ -382,8 +382,11 @@ sealed class Task extends Request {
     }
 
     Directory? downloadDirectory;
-    if (baseDirectory == BaseDirectory.downloads) {
+    if (baseDirectory == BaseDirectory.downloads && Platform.isAndroid) {
       downloadDirectory = Directory('/storage/emulated/0/Download');
+    }
+    if (baseDirectory == BaseDirectory.downloads && Platform.isIOS) {
+      downloadDirectory = await getDownloadsDirectory();
     }
     final Directory baseDir = await switch (baseDirectory) {
       BaseDirectory.applicationDocuments => getApplicationDocumentsDirectory(),
