@@ -383,9 +383,7 @@ sealed class Task extends Request {
 
     Directory? downloadDirectory;
     if (baseDirectory == BaseDirectory.downloads) {
-      downloadDirectory = (await getExternalStorageDirectories(
-              type: StorageDirectory.downloads))!
-          .first;
+      downloadDirectory = Directory('/storage/emulated/0/Download');
     }
     final Directory baseDir = await switch (baseDirectory) {
       BaseDirectory.applicationDocuments => getApplicationDocumentsDirectory(),
