@@ -2,16 +2,20 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:background_downloader/src/permissions.dart';
+import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:logging/logging.dart';
-import 'package:collection/collection.dart';
 
 import 'database.dart';
-import 'web_downloader.dart' if (dart.library.io) 'desktop_downloader.dart';
 import 'exceptions.dart';
 import 'models.dart';
 import 'native_downloader.dart';
 import 'persistent_storage.dart';
+import 'queue/task_queue.dart';
+import 'task.dart';
+import 'web_downloader.dart'
+    if (dart.library.io) 'desktop/desktop_downloader.dart';
 
 /// Common download functionality
 ///
@@ -29,17 +33,50 @@ abstract base class BaseDownloader {
 
   static const databaseVersion = 1;
 
+  /// Special group name for tasks that download a chunk, as part of a
+  /// [ParallelDownloadTask]
+  static const chunkGroup = 'chunk';
+
+  /// Completes when initialization is complete and downloader ready for use
+  final _readyCompleter = Completer<bool>();
+
+  /// True when initialization is complete and downloader ready for use
+  Future<bool> get ready => _readyCompleter.future;
+
   /// Persistent storage
   late final PersistentStorage _storage;
   late final Database database;
 
+  /// Set of tasks that are in `waitingToRetry` status
   final tasksWaitingToRetry = <Task>{};
+
+  /// Completers used to check task completion in convenience functions
+  final awaitTasks = <Task, Completer<TaskStatusUpdate>>{};
+
+  /// Registered short status callback for convenience down/upload tasks
+  ///
+  /// Short callbacks omit the [Task] as they are available from the closure
+  final _shortTaskStatusCallbacks = <String, void Function(TaskStatus)>{};
+
+  /// Registered short progress callback for convenience down/upload tasks
+  ///
+  /// Short callbacks omit the [Task] as they are available from the closure
+  final _shortTaskProgressCallbacks = <String, void Function(double)>{};
+
+  /// Registered [TaskStatusCallback] for convenience batch down/upload tasks
+  final _taskStatusCallbacks = <String, TaskStatusCallback>{};
+
+  /// Registered [TaskProgressCallback] for convenience batch down/upload tasks
+  final _taskProgressCallbacks = <String, TaskProgressCallback>{};
 
   /// Registered [TaskStatusCallback] for each group
   final groupStatusCallbacks = <String, TaskStatusCallback>{};
 
   /// Registered [TaskProgressCallback] for each group
   final groupProgressCallbacks = <String, TaskProgressCallback>{};
+
+  /// Active batches
+  final _batches = <Batch>[];
 
   /// Registered [TaskNotificationTapCallback] for each group
   final groupNotificationTapCallbacks = <String, TaskNotificationTapCallback>{};
@@ -58,6 +95,11 @@ abstract base class BaseDownloader {
 
   /// Flag indicating we have retrieved missed data
   var _retrievedLocallyStoredData = false;
+
+  /// Connected TaskQueues that will receive a signal upon task completion
+  final taskQueues = <TaskQueue>[];
+
+  final permissionsService = PermissionsService.instance();
 
   BaseDownloader();
 
@@ -82,8 +124,13 @@ abstract base class BaseDownloader {
   /// Initializes the PersistentStorage instance and if necessary perform database
   /// migration, then initializes the subclassed implementation for
   /// desktop or native
+  ///
+  ///
   @mustCallSuper
-  Future<void> initialize() => _storage.initialize();
+  Future<void> initialize() async {
+    await _storage.initialize();
+    _readyCompleter.complete(true);
+  }
 
   /// Configures the downloader
   ///
@@ -135,25 +182,20 @@ abstract base class BaseDownloader {
   Future<void> retrieveLocallyStoredData() async {
     if (!_retrievedLocallyStoredData) {
       final resumeDataMap = await popUndeliveredData(Undelivered.resumeData);
-      for (var taskId in resumeDataMap.keys) {
-        // map is <taskId, ResumeData>
-        final resumeData = ResumeData.fromJsonMap(resumeDataMap[taskId]);
+      for (var jsonString in resumeDataMap.values) {
+        final resumeData = ResumeData.fromJsonString(jsonString);
         await setResumeData(resumeData);
         await setPausedTask(resumeData.task);
       }
       final statusUpdateMap =
           await popUndeliveredData(Undelivered.statusUpdates);
-      for (var taskId in statusUpdateMap.keys) {
-        // map is <taskId, Task/TaskStatus> where TaskStatus is added to Task JSON
-        final payload = statusUpdateMap[taskId];
-        processStatusUpdate(TaskStatusUpdate.fromJsonMap(payload));
+      for (var jsonString in statusUpdateMap.values) {
+        processStatusUpdate(TaskStatusUpdate.fromJsonString(jsonString));
       }
       final progressUpdateMap =
           await popUndeliveredData(Undelivered.progressUpdates);
-      for (var taskId in progressUpdateMap.keys) {
-        // map is <taskId, Task/progress> where progress is added to Task JSON
-        final payload = progressUpdateMap[taskId];
-        processProgressUpdate(TaskProgressUpdate.fromJsonMap(payload));
+      for (var jsonString in progressUpdateMap.values) {
+        processProgressUpdate(TaskProgressUpdate.fromJsonString(jsonString));
       }
       _retrievedLocallyStoredData = true;
     }
@@ -163,6 +205,9 @@ abstract base class BaseDownloader {
   ///
   /// Matches on task, then on group, then on default
   TaskNotificationConfig? notificationConfigForTask(Task task) {
+    if (task.group == chunkGroup) {
+      return null;
+    }
     return notificationConfigs
             .firstWhereOrNull((config) => config.taskOrGroup == task) ??
         notificationConfigs
@@ -180,6 +225,112 @@ abstract base class BaseDownloader {
     return true;
   }
 
+  /// Enqueue the [task] and wait for completion
+  ///
+  /// Returns the final [TaskStatus] of the [task].
+  /// This method is used to enqueue:
+  /// 1. `download` and `upload` tasks, which may have a short callback
+  ///    for status and progress (omitting Task)
+  /// 2. `downloadBatch` and `uploadBatch`, which may have a full callback
+  ///    that is used for every task in the batch
+  Future<TaskStatusUpdate> enqueueAndAwait(Task task,
+      {void Function(TaskStatus)? onStatus,
+      void Function(double)? onProgress,
+      TaskStatusCallback? taskStatusCallback,
+      TaskProgressCallback? taskProgressCallback,
+      void Function(Duration)? onElapsedTime,
+      Duration? elapsedTimeInterval}) async {
+    // store the task-specific callbacks
+    if (onStatus != null) {
+      _shortTaskStatusCallbacks[task.taskId] = onStatus;
+    }
+    if (onProgress != null) {
+      _shortTaskProgressCallbacks[task.taskId] = onProgress;
+    }
+    if (taskStatusCallback != null) {
+      _taskStatusCallbacks[task.taskId] = taskStatusCallback;
+    }
+    if (taskProgressCallback != null) {
+      _taskProgressCallbacks[task.taskId] = taskProgressCallback;
+    }
+    // make sure the `updates` field is set correctly
+    final requiredUpdates = onProgress != null || taskProgressCallback != null
+        ? Updates.statusAndProgress
+        : Updates.status;
+    final Task taskToEnqueue;
+    if (task.updates != requiredUpdates) {
+      log.warning(
+          'TaskId ${task.taskId} has `updates` set to ${task.updates} but this should be '
+          '$requiredUpdates. Change to avoid issues.');
+      taskToEnqueue = task.copyWith(updates: requiredUpdates);
+    } else {
+      taskToEnqueue = task;
+    }
+    // start the elapsedTime timer if necessary. It is cancelled when the
+    // taskCompleter completes (when the task itself completes)
+    Timer? timer;
+    if (onElapsedTime != null) {
+      final interval = elapsedTimeInterval ?? const Duration(seconds: 5);
+      timer = Timer.periodic(interval, (timer) {
+        onElapsedTime(interval * timer.tick);
+      });
+    }
+    // Create taskCompleter and enqueue the task.
+    // The completer will be completed in the internal status callback
+    final taskCompleter = Completer<TaskStatusUpdate>();
+    awaitTasks[taskToEnqueue] = taskCompleter;
+    final enqueueSuccess = await enqueue(taskToEnqueue);
+    if (!enqueueSuccess) {
+      log.warning('Could not enqueue task $taskToEnqueue');
+      return Future.value(TaskStatusUpdate(taskToEnqueue, TaskStatus.failed,
+          TaskException('Could not enqueue task $taskToEnqueue')));
+    }
+    if (timer != null) {
+      taskCompleter.future.then((_) => timer?.cancel());
+    }
+    return taskCompleter.future;
+  }
+
+  /// Enqueue a list of tasks and wait for completion
+  ///
+  /// Returns a [Batch] object
+  Future<Batch> enqueueAndAwaitBatch(final List<Task> tasks,
+      {BatchProgressCallback? batchProgressCallback,
+      TaskStatusCallback? taskStatusCallback,
+      TaskProgressCallback? taskProgressCallback,
+      void Function(Duration)? onElapsedTime,
+      Duration? elapsedTimeInterval}) async {
+    assert(tasks.isNotEmpty, 'List of tasks cannot be empty');
+    if (batchProgressCallback != null) {
+      batchProgressCallback(0, 0); // initial callback
+    }
+    Timer? timer;
+    if (onElapsedTime != null) {
+      final interval = elapsedTimeInterval ?? const Duration(seconds: 5);
+      timer = Timer.periodic(interval, (timer) {
+        onElapsedTime(interval * timer.tick);
+      });
+    }
+    final batch = Batch(tasks, batchProgressCallback);
+    _batches.add(batch);
+    final taskFutures = <Future<TaskStatusUpdate>>[];
+    var counter = 0;
+    for (final task in tasks) {
+      taskFutures.add(enqueueAndAwait(task,
+          taskStatusCallback: taskStatusCallback,
+          taskProgressCallback: taskProgressCallback));
+      if (counter++ % 3 == 0) {
+        // To prevent blocking the UI we 'yield' for a few ms after every 3
+        // tasks we enqueue
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+    }
+    await Future.wait(taskFutures); // wait for all tasks to complete
+    _batches.remove(batch);
+    timer?.cancel();
+    return batch;
+  }
+
   /// Resets the download worker by cancelling all ongoing tasks for the group
   ///
   ///  Returns the number of tasks canceled
@@ -190,13 +341,18 @@ abstract base class BaseDownloader {
     tasksWaitingToRetry.removeWhere((task) => task.group == group);
     final pausedTasks = await getPausedTasks();
     var pausedCount = 0;
-    for (var task in pausedTasks) {
+    for (final task in pausedTasks) {
       if (task.group == group) {
         await removePausedTask(task.taskId);
         pausedCount++;
       }
     }
-    return retryCount + pausedCount;
+    final awaitTasksToRemove =
+        awaitTasks.keys.where((task) => task.group == group).toList();
+    for (final task in awaitTasksToRemove) {
+      awaitTasks.remove(task);
+    }
+    return retryCount + pausedCount + awaitTasksToRemove.length;
   }
 
   /// Returns a list of all tasks in progress, matching [group]
@@ -228,6 +384,7 @@ abstract base class BaseDownloader {
       tasksWaitingToRetry.remove(task);
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
       processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
+      updateNotification(task, null); // remove notification
     }
     final remainingTaskIds = taskIds
         .where((taskId) => !matchingTaskIdsWaitingToRetry.contains(taskId));
@@ -271,6 +428,7 @@ abstract base class BaseDownloader {
         }
         processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
         processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
+        updateNotification(task, null); // remove notification
       }
     }
   }
@@ -304,6 +462,7 @@ abstract base class BaseDownloader {
   /// the app was suspended, provided you have registered your listeners
   /// or callback before calling this.
   Future<void> trackTasks(String? group, bool markDownloadedComplete) async {
+    await ready; // no database operations until ready
     trackedGroups.add(group);
     if (markDownloadedComplete) {
       final records = await database.allRecords(group: group);
@@ -396,7 +555,7 @@ abstract base class BaseDownloader {
       _storage.removePausedTask(taskId);
 
   /// Retrieve data that was not delivered to Dart
-  Future<Map<String, dynamic>> popUndeliveredData(Undelivered dataType);
+  Future<Map<String, String>> popUndeliveredData(Undelivered dataType);
 
   /// Clear pause and resume info associated with this [task]
   void _clearPauseResumeInfo(Task task) {
@@ -404,14 +563,6 @@ abstract base class BaseDownloader {
     removeResumeData(task.taskId);
     removePausedTask(task.taskId);
   }
-
-  /// Get the duration for a task to timeout - Android only, for testing
-  @visibleForTesting
-  Future<Duration> getTaskTimeout();
-
-  /// Set forceFailPostOnBackgroundChannel for native downloader
-  @visibleForTesting
-  Future<void> setForceFailPostOnBackgroundChannel(bool value);
 
   /// Move the file at [filePath] to the shared storage
   /// [destination] and potential subdirectory [directory]
@@ -440,30 +591,26 @@ abstract base class BaseDownloader {
   /// Precondition: either task or filename is not null
   Future<bool> openFile(Task? task, String? filePath, String? mimeType);
 
-  /// Stores modified [modifiedTask] in local storage if [Task.group]
-  /// or [Task.updates] fields differ from [originalTask]
-  ///
-  /// Modification happens in convenience functions, and storing the modified
-  /// version allows us to replace the original when used in pause/resume
-  /// functionality. Without this, a convenience download may not be able to
-  /// resume using the original [modifiedTask] object (as the [Task.group]
-  /// and [Task.updates] fields may have been modified)
-  Future<void> setModifiedTask(Task modifiedTask, Task originalTask) async {
-    if (modifiedTask.group != originalTask.group ||
-        modifiedTask.updates != originalTask.updates) {
-      await _storage.storeModifiedTask(modifiedTask);
-    }
-  }
+  /// Return the platform version as a String
+  Future<String> platformVersion() =>
+      Future.value(Platform.operatingSystemVersion);
 
-  /// Retrieves modified version of the [originalTask] or null
-  ///
-  /// See [setModifiedTask]
-  Future<Task?> getModifiedTask(Task originalTask) =>
-      _storage.retrieveModifiedTask(originalTask.taskId);
+  // Testing methods
 
-  /// Remove modified [task], or all if null
-  Future<void> removeModifiedTask([Task? task]) =>
-      _storage.removeModifiedTask(task?.taskId);
+  /// Get the duration for a task to timeout - Android only, for testing
+  @visibleForTesting
+  Future<Duration> getTaskTimeout();
+
+  /// Set forceFailPostOnBackgroundChannel for native downloader
+  @visibleForTesting
+  Future<void> setForceFailPostOnBackgroundChannel(bool value);
+
+  /// Test suggested filename based on task and content disposition header
+  @visibleForTesting
+  Future<String> testSuggestedFilename(
+      DownloadTask task, String contentDisposition);
+
+  // Helper methods
 
   /// Closes the [updates] stream and re-initializes the [StreamController]
   /// such that the stream can be listened to again
@@ -472,24 +619,6 @@ abstract base class BaseDownloader {
       await updates.close();
     }
     updates = StreamController();
-  }
-
-  /// Destroy - clears callbacks, updates stream and retry queue
-  ///
-  /// Clears all queues and references without sending cancellation
-  /// messages or status updates
-  @mustCallSuper
-  void destroy() {
-    tasksWaitingToRetry.clear();
-    groupStatusCallbacks.clear();
-    groupProgressCallbacks.clear();
-    notificationConfigs.clear();
-    trackedGroups.clear();
-    canResumeTask.clear();
-    removeResumeData(); // removes all
-    removePausedTask(); // removes all
-    removeModifiedTask(); // removes all
-    resetUpdatesStreamController();
   }
 
   /// Process status update coming from Downloader and emit to listener
@@ -520,7 +649,6 @@ abstract base class BaseDownloader {
               await enqueue(task))) {
             log.warning(
                 'Could not resume/enqueue taskId ${task.taskId} after retry timeout');
-            removeModifiedTask(task);
             _clearPauseResumeInfo(task);
             _emitStatusUpdate(TaskStatusUpdate(
                 task,
@@ -537,8 +665,10 @@ abstract base class BaseDownloader {
         setPausedTask(task);
       }
       if (update.status.isFinalState) {
-        removeModifiedTask(task);
         _clearPauseResumeInfo(task);
+      }
+      if (update.status.isFinalState || update.status == TaskStatus.paused) {
+        notifyTaskQueues(task);
       }
       _emitStatusUpdate(update);
     }
@@ -546,7 +676,25 @@ abstract base class BaseDownloader {
 
   /// Process progress update coming from Downloader to client listener
   void processProgressUpdate(TaskProgressUpdate update) {
+    switch (update.progress) {
+      case progressComplete:
+      case progressFailed:
+      case progressNotFound:
+      case progressCanceled:
+      case progressPaused:
+        notifyTaskQueues(update.task);
+
+      default:
+      // no-op
+    }
     _emitProgressUpdate(update);
+  }
+
+  /// Notify all [taskQueues] that this task has finished
+  void notifyTaskQueues(Task task) {
+    for (var taskQueue in taskQueues) {
+      taskQueue.taskFinished(task);
+    }
   }
 
   /// Process user tapping on a notification
@@ -577,17 +725,25 @@ abstract base class BaseDownloader {
     _updateTaskInDatabase(task,
         status: update.status, taskException: update.exception);
     if (task.providesStatusUpdates) {
-      final taskStatusCallback = groupStatusCallbacks[task.group];
-      if (taskStatusCallback != null) {
-        taskStatusCallback(update);
+      // handle the statusUpdate in order of priority:
+      // handle [awaitTasks], otherwise try [groupStatusCallbacks],
+      // otherwise try [updates] listener, otherwise log warning
+      // for missing handler
+      if (awaitTasks.containsKey(task)) {
+        _awaitTaskStatusCallback(update);
       } else {
-        if (updates.hasListener) {
-          updates.add(update);
+        final taskStatusCallback = groupStatusCallbacks[task.group];
+        if (taskStatusCallback != null) {
+          taskStatusCallback(update);
         } else {
-          log.warning('Requested status updates for task ${task.taskId} in '
-              'group ${task.group} but no TaskStatusCallback '
-              'was registered, and there is no listener to the '
-              'updates stream');
+          if (updates.hasListener) {
+            updates.add(update);
+          } else {
+            log.warning('Requested status updates for task ${task.taskId} in '
+                'group ${task.group} but no TaskStatusCallback '
+                'was registered, and there is no listener to the '
+                'updates stream');
+          }
         }
       }
     }
@@ -598,20 +754,81 @@ abstract base class BaseDownloader {
   void _emitProgressUpdate(TaskProgressUpdate update) {
     final task = update.task;
     if (task.providesProgressUpdates) {
+      // handle the progressUpdate in order of priority:
+      // handle [awaitTasks], otherwise try [groupProgressCallbacks],
+      // otherwise try [updates] listener, otherwise log warning
+      // for missing handler
       _updateTaskInDatabase(task,
           progress: update.progress, expectedFileSize: update.expectedFileSize);
-      final taskProgressCallback = groupProgressCallbacks[task.group];
-      if (taskProgressCallback != null) {
-        taskProgressCallback(update);
-      } else if (updates.hasListener) {
-        updates.add(update);
+      if (awaitTasks.containsKey(task)) {
+        _awaitTaskProgressCallBack(update);
       } else {
-        log.warning('Requested progress updates for task ${task.taskId} in '
-            'group ${task.group} but no TaskProgressCallback '
-            'was registered, and there is no listener to the '
-            'updates stream');
+        final taskProgressCallback = groupProgressCallbacks[task.group];
+        if (taskProgressCallback != null) {
+          taskProgressCallback(update);
+        } else if (updates.hasListener) {
+          updates.add(update);
+        } else {
+          log.warning('Requested progress updates for task ${task.taskId} in '
+              'group ${task.group} but no TaskProgressCallback '
+              'was registered, and there is no listener to the '
+              'updates stream');
+        }
       }
     }
+  }
+
+  /// Update or remove notification for task
+  ///
+  /// If [taskStatusOrNull] is null, removes notification
+  void updateNotification(Task task, TaskStatus? taskStatusOrNull) {}
+
+  /// Internal callback function for [awaitTasks] that passes the update
+  /// on to different callbacks
+  ///
+  /// The update is passed on to:
+  /// 1. Task-specific callback, passed as parameter to [enqueueAndAwait] call
+  /// 2. Short task-specific callback, passed as parameter to call
+  /// 3. Batch-related callback, if this task is part of a batch operation
+  ///    and is in a final state
+  ///
+  /// If the task is in final state, also removes the reference to the
+  /// task-specific callbacks and completes the completer associated
+  /// with this task
+  _awaitTaskStatusCallback(TaskStatusUpdate statusUpdate) {
+    final task = statusUpdate.task;
+    final status = statusUpdate.status;
+    _shortTaskStatusCallbacks[task.taskId]?.call(status);
+    _taskStatusCallbacks[task.taskId]?.call(statusUpdate);
+    if (status.isFinalState) {
+      if (_batches.isNotEmpty) {
+        // check if this task is part of a batch
+        for (final batch in _batches) {
+          if (batch.tasks.contains(task)) {
+            batch.results[task] = status;
+            if (batch.batchProgressCallback != null) {
+              batch.batchProgressCallback!(batch.numSucceeded, batch.numFailed);
+            }
+            break;
+          }
+        }
+      }
+      _shortTaskStatusCallbacks.remove(task.taskId);
+      _shortTaskProgressCallbacks.remove(task.taskId);
+      _taskStatusCallbacks.remove(task.taskId);
+      _taskProgressCallbacks.remove(task.taskId);
+      var taskCompleter = awaitTasks.remove(task);
+      taskCompleter?.complete(statusUpdate);
+    }
+  }
+
+  /// Internal callback function that only passes progress updates on
+  /// to the task-specific progress callback passed as parameter
+  /// to the [enqueueAndAwait] call
+  _awaitTaskProgressCallBack(TaskProgressUpdate progressUpdate) {
+    _shortTaskProgressCallbacks[progressUpdate.task.taskId]
+        ?.call(progressUpdate.progress);
+    _taskProgressCallbacks[progressUpdate.task.taskId]?.call(progressUpdate);
   }
 
   /// Insert or update the [TaskRecord] in the tracking database
@@ -651,5 +868,28 @@ abstract base class BaseDownloader {
             existingRecord?.progress ?? 0, expectedFileSize, taskException));
       }
     }
+  }
+
+  /// Destroy - clears callbacks, updates stream and retry queue
+  ///
+  /// Clears all queues and references without sending cancellation
+  /// messages or status updates
+  @mustCallSuper
+  void destroy() {
+    tasksWaitingToRetry.clear();
+    _batches.clear();
+    awaitTasks.clear();
+    _shortTaskStatusCallbacks.clear();
+    _shortTaskProgressCallbacks.clear();
+    _taskStatusCallbacks.clear();
+    _taskProgressCallbacks.clear();
+    groupStatusCallbacks.clear();
+    groupProgressCallbacks.clear();
+    notificationConfigs.clear();
+    trackedGroups.clear();
+    canResumeTask.clear();
+    removeResumeData(); // removes all
+    removePausedTask(); // removes all
+    resetUpdatesStreamController();
   }
 }

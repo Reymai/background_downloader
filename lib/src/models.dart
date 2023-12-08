@@ -1,18 +1,7 @@
 import 'dart:convert';
-import 'dart:io';
-import 'dart:math';
-import 'dart:typed_data';
-
-import 'package:logging/logging.dart';
-import 'package:mime/mime.dart';
-import 'package:path/path.dart' as path;
-import 'package:path_provider/path_provider.dart';
 
 import 'exceptions.dart';
-import 'file_downloader.dart';
-import 'web_downloader.dart' if (dart.library.io) 'desktop_downloader.dart';
-
-final _log = Logger('FileDownloader');
+import 'task.dart';
 
 /// Defines a set of possible states which a [Task] can be in.
 enum TaskStatus {
@@ -106,7 +95,15 @@ enum BaseDirectory {
 
   /// As returned by get getDownloadsDirectory() for Android, and by get
   /// getApplicationSupportDirectory() for iOS
-  downloads
+  downloads,
+
+  /// System root directory. This allows you to set a path to any directory
+  /// via [Task.directory]. Only use this if you are certain that this
+  /// path is stable. on iOS and Android, references to paths within
+  /// the application's directory structure are *not* stable, and you
+  /// should use [applicationDocuments], [applicationSupport] or
+  /// [applicationLibrary] instead to avoid errors.
+  root
 }
 
 /// Type of updates requested for a task or group of tasks
@@ -143,912 +140,6 @@ typedef TaskProgressCallback = void Function(TaskProgressUpdate update);
 /// is tapped by the user
 typedef TaskNotificationTapCallback = void Function(
     Task task, NotificationType notificationType);
-
-/// A server Request
-///
-/// An equality test on a [Request] is an equality test on the [url]
-base class Request {
-  final validHttpMethods = ['GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH'];
-
-  /// String representation of the url, urlEncoded
-  final String url;
-
-  /// potential additional headers to send with the request
-  final Map<String, String> headers;
-
-  /// HTTP request method to use
-  final String httpRequestMethod;
-
-  /// Set [post] to make the request using POST instead of GET.
-  /// In the constructor, [post] must be one of the following:
-  /// - a String: POST request with [post] as the body, encoded in utf8
-  /// - a List of bytes: POST request with [post] as the body
-  ///
-  /// The field [post] will be a UInt8List representing the bytes, or the String
-  final String? post;
-
-  /// Maximum number of retries the downloader should attempt
-  ///
-  /// Defaults to 0, meaning no retry will be attempted
-  final int retries;
-
-  /// Number of retries remaining
-  int retriesRemaining;
-
-  /// Time at which this request was first created
-  final DateTime creationTime;
-
-  /// Creates a [Request]
-  ///
-  /// [url] must not be encoded and can include query parameters
-  /// [urlQueryParameters] may be added and will be appended to the [url]
-  /// [headers] an optional map of HTTP request headers
-  /// [post] if set, uses POST instead of GET. Post must be one of the
-  /// following:
-  /// - a String: POST request with [post] as the body, encoded in utf8
-  /// - a List of bytes: POST request with [post] as the body
-  ///
-  /// [retries] if >0 will retry a failed download this many times
-  Request(
-      {required String url,
-      Map<String, String>? urlQueryParameters,
-      this.headers = const {},
-      String? httpRequestMethod,
-      post,
-      this.retries = 0,
-      DateTime? creationTime})
-      : url = _urlWithQueryParameters(url, urlQueryParameters),
-        httpRequestMethod =
-            httpRequestMethod?.toUpperCase() ?? (post == null ? 'GET' : 'POST'),
-        post = post is Uint8List ? String.fromCharCodes(post) : post,
-        retriesRemaining = retries,
-        creationTime = creationTime ?? DateTime.now() {
-    if (retries < 0 || retries > 10) {
-      throw ArgumentError('Number of retries must be in range 1 through 10');
-    }
-    if (!validHttpMethods.contains(this.httpRequestMethod)) {
-      throw ArgumentError(
-          'Invalid httpRequestMethod "${this.httpRequestMethod}": Must be one of ${validHttpMethods.join(', ')}');
-    }
-  }
-
-  /// Creates object from JsonMap
-  Request.fromJsonMap(Map<String, dynamic> jsonMap)
-      : url = jsonMap['url'] ?? '',
-        headers = Map<String, String>.from(jsonMap['headers'] ?? {}),
-        httpRequestMethod = jsonMap['httpRequestMethod'] as String? ??
-            (jsonMap['post'] == null ? 'GET' : 'POST'),
-        post = jsonMap['post'] as String?,
-        retries = (jsonMap['retries'] as num?)?.toInt() ?? 0,
-        retriesRemaining = (jsonMap['retriesRemaining'] as num?)?.toInt() ?? 0,
-        creationTime = DateTime.fromMillisecondsSinceEpoch(
-            (jsonMap['creationTime'] as num?)?.toInt() ?? 0);
-
-  /// Creates JSON map of this object
-  Map<String, dynamic> toJsonMap() => {
-        'url': url,
-        'headers': headers,
-        'httpRequestMethod': httpRequestMethod,
-        'post': post,
-        'retries': retries,
-        'retriesRemaining': retriesRemaining,
-        'creationTime': creationTime.millisecondsSinceEpoch
-      };
-
-  /// Decrease [retriesRemaining] by one
-  void decreaseRetriesRemaining() => retriesRemaining--;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is Request && runtimeType == other.runtimeType && url == other.url;
-
-  @override
-  int get hashCode => url.hashCode;
-
-  @override
-  String toString() {
-    return 'Request{url: $url, headers: $headers, httpRequestMethod: '
-        '$httpRequestMethod, post: ${post == null ? "null" : "not null"}, '
-        'retries: $retries, retriesRemaining: $retriesRemaining}';
-  }
-}
-
-/// RegEx to match a path separator
-final _pathSeparator = RegExp(r'[/\\]');
-final _startsWithPathSeparator = RegExp(r'^[/\\]');
-
-/// Information related to a [Task]
-///
-/// A [Task] is the base class for [DownloadTask] and
-/// [UploadTask]
-///
-/// An equality test on a [Task] is a test on the [taskId]
-/// only - all other fields are ignored in that test
-sealed class Task extends Request {
-  /// Identifier for the task - auto generated if omitted
-  final String taskId;
-
-  /// Filename of the file to store
-  final String filename;
-
-  /// Optional directory, relative to the base directory
-  final String directory;
-
-  /// Base directory
-  final BaseDirectory baseDirectory;
-
-  /// Group that this task belongs to
-  final String group;
-
-  /// Type of progress updates desired
-  final Updates updates;
-
-  /// If true, will not download over cellular (metered) network
-  final bool requiresWiFi;
-
-  /// If true, task will pause if the task fails partly through the execution,
-  /// when some but not all bytes have transferred, provided the server supports
-  /// partial transfers. Such failures are typically temporary, eg due to
-  /// connectivity issues, and may be resumed when connectivity returns.
-  /// If false, task fails on any issue, and task cannot be paused
-  final bool allowPause;
-
-  /// User-defined metadata
-  final String metaData;
-
-  /// Creates a [Task]
-  ///
-  /// [taskId] must be unique. A unique id will be generated if omitted
-  /// [url] properly encoded if necessary, can include query parameters
-  /// [urlQueryParameters] may be added and will be appended to the [url], must
-  ///   be properly encoded if necessary
-  /// [filename] of the file to save. If omitted, a random filename will be
-  /// generated
-  /// [headers] an optional map of HTTP request headers
-  /// [httpRequestMethod] the HTTP request method used (e.g. GET, POST)
-  /// [post] if set, uses POST instead of GET. Post must be one of the
-  /// following:
-  /// - a String: POST request with [post] as the body, encoded in utf8
-  /// - a List of bytes: POST request with [post] as the body
-  /// [directory] optional directory name, precedes [filename]
-  /// [baseDirectory] one of the base directories, precedes [directory]
-  /// [group] if set allows different callbacks or processing for different
-  /// groups
-  /// [updates] the kind of progress updates requested
-  /// [requiresWiFi] if set, will not start download until WiFi is available.
-  /// If not set may start download over cellular network
-  /// [retries] if >0 will retry a failed download this many times
-  /// [allowPause]
-  /// If true, task will pause if the task fails partly through the execution,
-  /// when some but not all bytes have transferred, provided the server supports
-  /// partial transfers. Such failures are typically temporary, eg due to
-  /// connectivity issues, and may be resumed when connectivity returns
-  /// [metaData] user data
-  /// [creationTime] time of task creation, 'now' by default.
-  Task(
-      {String? taskId,
-      required super.url,
-      super.urlQueryParameters,
-      String? filename,
-      super.headers,
-      super.httpRequestMethod,
-      super.post,
-      this.directory = '',
-      this.baseDirectory = BaseDirectory.applicationDocuments,
-      this.group = 'default',
-      this.updates = Updates.status,
-      this.requiresWiFi = false,
-      super.retries,
-      this.metaData = '',
-      this.allowPause = false,
-      super.creationTime})
-      : taskId = taskId ?? Random().nextInt(1 << 32).toString(),
-        filename = filename ?? Random().nextInt(1 << 32).toString() {
-    if (filename?.isEmpty == true) {
-      throw ArgumentError('Filename cannot be empty');
-    }
-    if (_pathSeparator.hasMatch(this.filename) && this is! MultiUploadTask) {
-      throw ArgumentError('Filename cannot contain path separators');
-    }
-    if (_startsWithPathSeparator.hasMatch(directory)) {
-      throw ArgumentError(
-          'Directory must be relative to the baseDirectory specified in the baseDirectory argument');
-    }
-    if (allowPause && post != null) {
-      throw ArgumentError('Tasks that can pause must be GET requests');
-    }
-  }
-
-  /// Create a new [Task] subclass from the provided [jsonMap]
-  factory Task.createFromJsonMap(Map<String, dynamic> jsonMap) =>
-      switch (jsonMap['taskType']) {
-        'DownloadTask' => DownloadTask.fromJsonMap(jsonMap),
-        'UploadTask' => UploadTask.fromJsonMap(jsonMap),
-        'MultiUploadTask' => MultiUploadTask.fromJsonMap(jsonMap),
-        _ => throw ArgumentError(
-            'taskType not in [DownloadTask, UploadTask, MultiUploadTask]')
-      };
-
-  /// Returns the absolute path to the file represented by this task
-  /// based on the [Task.filename] (default) or [withFilename]
-  ///
-  /// If the task is a MultiUploadTask and no [withFilename] is given,
-  /// returns the empty string, as there is no single path that can be
-  /// returned.
-  Future<String> filePath({String? withFilename}) async {
-    if (this is MultiUploadTask && withFilename == null) {
-      return '';
-    }
-
-    Directory? downloadDirectory;
-    if (baseDirectory == BaseDirectory.downloads && Platform.isAndroid) {
-      downloadDirectory = Directory('/storage/emulated/0/Download');
-    }
-    if (baseDirectory == BaseDirectory.downloads && Platform.isIOS) {
-      downloadDirectory = await getDownloadsDirectory();
-    }
-    final Directory baseDir = await switch (baseDirectory) {
-      BaseDirectory.applicationDocuments => getApplicationDocumentsDirectory(),
-      BaseDirectory.temporary => getTemporaryDirectory(),
-      BaseDirectory.applicationSupport => getApplicationSupportDirectory(),
-      BaseDirectory.applicationLibrary
-          when Platform.isMacOS || Platform.isIOS =>
-        getLibraryDirectory(),
-      BaseDirectory.applicationLibrary => Future.value(Directory(
-          path.join((await getApplicationSupportDirectory()).path, 'Library'))),
-      BaseDirectory.downloads => Future.value(downloadDirectory),
-    };
-    return path.join(baseDir.path, directory, withFilename ?? filename);
-  }
-
-  /// Returns a copy of the [Task] with optional changes to specific fields
-  Task copyWith(
-      {String? taskId,
-      String? url,
-      String? filename,
-      Map<String, String>? headers,
-      String? httpRequestMethod,
-      Object? post,
-      String? directory,
-      BaseDirectory? baseDirectory,
-      String? group,
-      Updates? updates,
-      bool? requiresWiFi,
-      int? retries,
-      int? retriesRemaining,
-      bool? allowPause,
-      String? metaData,
-      DateTime? creationTime});
-
-  /// Creates [Task] object from JsonMap
-  ///
-  /// Only used by subclasses. Use [createFromJsonMap] to create a properly
-  /// subclassed [Task] from the [jsonMap]
-  Task.fromJsonMap(Map<String, dynamic> jsonMap)
-      : taskId = jsonMap['taskId'] ?? '',
-        filename = jsonMap['filename'] ?? '',
-        directory = jsonMap['directory'] ?? '',
-        baseDirectory = BaseDirectory
-            .values[(jsonMap['baseDirectory'] as num?)?.toInt() ?? 0],
-        group = jsonMap['group'] ?? FileDownloader.defaultGroup,
-        updates = Updates.values[(jsonMap['updates'] as num?)?.toInt() ?? 0],
-        requiresWiFi = jsonMap['requiresWiFi'] ?? false,
-        allowPause = jsonMap['allowPause'] ?? false,
-        metaData = jsonMap['metaData'] ?? '',
-        super.fromJsonMap(jsonMap);
-
-  /// Creates JSON map of this object
-  @override
-  Map<String, dynamic> toJsonMap() => {
-        ...super.toJsonMap(),
-        'taskId': taskId,
-        'filename': filename,
-        'directory': directory,
-        'baseDirectory': baseDirectory.index, // stored as int
-        'group': group,
-        'updates': updates.index, // stored as int
-        'requiresWiFi': requiresWiFi,
-        'allowPause': allowPause,
-        'metaData': metaData,
-        'taskType': taskType
-      };
-
-  /// If true, task expects progress updates
-  bool get providesProgressUpdates =>
-      updates == Updates.progress || updates == Updates.statusAndProgress;
-
-  /// If true, task expects status updates
-  bool get providesStatusUpdates =>
-      updates == Updates.status || updates == Updates.statusAndProgress;
-
-  /// Returns the type of task as a String
-  ///
-  /// Used to identify the task type in JSON format
-  String get taskType => 'Task';
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is Task &&
-          runtimeType == other.runtimeType &&
-          taskId == other.taskId;
-
-  @override
-  int get hashCode => taskId.hashCode;
-
-  @override
-  String toString() {
-    return '$taskType{taskId: $taskId, url: $url, filename: $filename, headers: '
-        '$headers, httpRequestMethod: $httpRequestMethod, post: ${post == null ? "null" : "not null"}, directory: $directory, baseDirectory: $baseDirectory, group: $group, updates: $updates, requiresWiFi: $requiresWiFi, retries: $retries, retriesRemaining: $retriesRemaining, metaData: $metaData}';
-  }
-}
-
-/// Information related to a download task
-///
-/// An equality test on a [DownloadTask] is a test on the [taskId]
-/// only - all other fields are ignored in that test
-final class DownloadTask extends Task {
-  /// Creates a [DownloadTask]
-  ///
-  /// [taskId] must be unique. A unique id will be generated if omitted
-  /// [url] properly encoded if necessary, can include query parameters
-  /// [urlQueryParameters] may be added and will be appended to the [url], must
-  ///   be properly encoded if necessary
-  /// [filename] of the file to save. If omitted, a random filename will be
-  /// generated
-  /// [headers] an optional map of HTTP request headers
-  /// [httpRequestMethod] the HTTP request method used (e.g. GET, POST)
-  /// [post] if set, uses POST instead of GET. Post must be one of the
-  /// following:
-  /// - true: POST request without a body
-  /// - a String: POST request with [post] as the body, encoded in utf8 and
-  ///   content-type 'text/plain'
-  /// - a List of bytes: POST request with [post] as the body
-  /// - a Map: POST request with [post] as form fields, encoded in utf8 and
-  ///   content-type 'application/x-www-form-urlencoded'
-  ///
-  /// [directory] optional directory name, precedes [filename]
-  /// [baseDirectory] one of the base directories, precedes [directory]
-  /// [group] if set allows different callbacks or processing for different
-  /// groups
-  /// [updates] the kind of progress updates requested
-  /// [requiresWiFi] if set, will not start download until WiFi is available.
-  /// If not set may start download over cellular network
-  /// [retries] if >0 will retry a failed download this many times
-  /// [metaData] user data
-  /// [creationTime] time of task creation, 'now' by default.
-  DownloadTask(
-      {super.taskId,
-      required super.url,
-      super.urlQueryParameters,
-      super.filename,
-      super.headers,
-      super.httpRequestMethod,
-      super.post,
-      super.directory,
-      super.baseDirectory,
-      super.group,
-      super.updates,
-      super.requiresWiFi,
-      super.retries,
-      super.allowPause,
-      super.metaData,
-      super.creationTime});
-
-  /// Creates [DownloadTask] object from JsonMap
-  DownloadTask.fromJsonMap(Map<String, dynamic> jsonMap)
-      : assert(
-            jsonMap['taskType'] == 'DownloadTask',
-            'The provided JSON map is not'
-            ' a DownloadTask, because key "taskType" is not "DownloadTask".'),
-        super.fromJsonMap(jsonMap);
-
-  @override
-  String get taskType => 'DownloadTask';
-
-  @override
-  DownloadTask copyWith(
-          {String? taskId,
-          String? url,
-          String? filename,
-          Map<String, String>? headers,
-          String? httpRequestMethod,
-          Object? post,
-          String? directory,
-          BaseDirectory? baseDirectory,
-          String? group,
-          Updates? updates,
-          bool? requiresWiFi,
-          int? retries,
-          int? retriesRemaining,
-          bool? allowPause,
-          String? metaData,
-          DateTime? creationTime}) =>
-      DownloadTask(
-          taskId: taskId ?? this.taskId,
-          url: url ?? this.url,
-          filename: filename ?? this.filename,
-          headers: headers ?? this.headers,
-          httpRequestMethod: httpRequestMethod ?? this.httpRequestMethod,
-          post: post ?? this.post,
-          directory: directory ?? this.directory,
-          baseDirectory: baseDirectory ?? this.baseDirectory,
-          group: group ?? this.group,
-          updates: updates ?? this.updates,
-          requiresWiFi: requiresWiFi ?? this.requiresWiFi,
-          retries: retries ?? this.retries,
-          allowPause: allowPause ?? this.allowPause,
-          metaData: metaData ?? this.metaData,
-          creationTime: creationTime ?? this.creationTime)
-        ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
-
-  /// Returns a copy of the task with the [Task.filename] property changed
-  /// to the filename suggested by the server, or derived from the url, or
-  /// unchanged.
-  ///
-  /// If [unique] is true, the filename is guaranteed not to already exist. This
-  /// is accomplished by adding a suffix to the suggested filename with a number,
-  /// e.g. "data (2).txt"
-  ///
-  /// The suggested filename is obtained by making a HEAD request to the url
-  /// represented by the [DownloadTask], including urlQueryParameters and headers
-  Future<DownloadTask> withSuggestedFilename({unique = false}) async {
-    /// Returns [DownloadTask] with a filename similar to the one
-    /// supplied, but unused.
-    ///
-    /// If [unique], filename will sequence up in "filename (8).txt" format,
-    /// otherwise returns the [task]
-    Future<DownloadTask> uniqueFilename(DownloadTask task, bool unique) async {
-      if (!unique) {
-        return task;
-      }
-      final sequenceRegEx = RegExp(r'\((\d+)\)\.?[^.]*$');
-      final extensionRegEx = RegExp(r'\.[^.]*$');
-      var newTask = task;
-      var filePath = await newTask.filePath();
-      var exists = await File(filePath).exists();
-      while (exists) {
-        final extension =
-            extensionRegEx.firstMatch(newTask.filename)?.group(0) ?? '';
-        final match = sequenceRegEx.firstMatch(newTask.filename);
-        final newSequence = int.parse(match?.group(1) ?? "0") + 1;
-        final newFilename = match == null
-            ? '${path.basenameWithoutExtension(newTask.filename)} ($newSequence)$extension'
-            : '${newTask.filename.substring(0, match.start - 1)} ($newSequence)$extension';
-        newTask = newTask.copyWith(filename: newFilename);
-        filePath = await newTask.filePath();
-        exists = await File(filePath).exists();
-      }
-      return newTask;
-    }
-
-    try {
-      final response = await DesktopDownloader.httpClient
-          .head(Uri.parse(url), headers: headers);
-      if ([200, 201, 202, 203, 204, 205, 206].contains(response.statusCode)) {
-        final disposition = response.headers.entries
-            .firstWhere(
-                (element) => element.key.toLowerCase() == 'content-disposition')
-            .value;
-        // Try filename="filename"
-        final plainFilenameRegEx =
-            RegExp(r'filename="?([^"]+)"?.*$', caseSensitive: false);
-        var match = plainFilenameRegEx.firstMatch(disposition);
-        if (match != null && match.group(1)?.isNotEmpty == true) {
-          return uniqueFilename(copyWith(filename: match.group(1)), unique);
-        }
-        // Try filename*=UTF-8'language'"encodedFilename"
-        final encodedFilenameRegEx = RegExp(
-            'filename\\*=([^\']+)\'([^\']*)\'"?([^"]+)"?',
-            caseSensitive: false);
-        match = encodedFilenameRegEx.firstMatch(disposition);
-        if (match != null &&
-            match.group(1)?.isNotEmpty == true &&
-            match.group(3)?.isNotEmpty == true) {
-          try {
-            final suggestedFilename = match.group(1) == 'UTF-8'
-                ? Uri.decodeComponent(match.group(3)!)
-                : match.group(3)!;
-            return uniqueFilename(copyWith(filename: suggestedFilename), true);
-          } on ArgumentError {
-            _log.finer(
-                'Could not interpret suggested filename (UTF-8 url encoded) ${match.group(3)}');
-          }
-        }
-      }
-    } catch (e) {
-      _log.finer('Could not determine suggested filename from server');
-    }
-    // Try filename derived from last path segment of the url
-    try {
-      final suggestedFilename = Uri.parse(url).pathSegments.last;
-      return uniqueFilename(copyWith(filename: suggestedFilename), unique);
-    } catch (e) {
-      _log.finer('Could not parse URL pathSegment for suggested filename: $e');
-    }
-    // if everything fails, return the task with unchanged filename
-    // except for possibly making it unique
-    return uniqueFilename(this, unique);
-  }
-
-  /// Return the expected file size for this task, or -1 if unknown
-  ///
-  /// The expected file size is obtained by making a HEAD request to the url
-  /// represented by the [DownloadTask], including urlQueryParameters and headers
-  Future<int> expectedFileSize() async {
-    try {
-      final response = await DesktopDownloader.httpClient
-          .head(Uri.parse(url), headers: headers);
-      if ([200, 201, 202, 203, 204, 205, 206].contains(response.statusCode)) {
-        return int.parse(response.headers.entries
-            .firstWhere(
-                (element) => element.key.toLowerCase() == 'content-length')
-            .value);
-      }
-    } catch (e) {
-      // no content length available
-    }
-    return -1;
-  }
-}
-
-/// Information related to an upload task
-///
-/// An equality test on a [UploadTask] is a test on the [taskId]
-/// only - all other fields are ignored in that test
-final class UploadTask extends Task {
-  /// Name of the field used for multi-part file upload
-  final String fileField;
-
-  /// mimeType of the file to upload
-  final String mimeType;
-
-  /// Map of name/value pairs to encode as form fields in a multi-part upload
-  final Map<String, String> fields;
-
-  /// Creates [UploadTask]
-  ///
-  /// [taskId] must be unique. A unique id will be generated if omitted
-  /// [url] properly encoded if necessary, can include query parameters
-  /// [urlQueryParameters] may be added and will be appended to the [url], must
-  ///   be properly encoded if necessary
-  /// [filename] of the file to upload
-  /// [headers] an optional map of HTTP request headers
-  /// [httpRequestMethod] the HTTP request method used (e.g. GET, POST)
-  /// [post] if set to 'binary' will upload as binary file, otherwise multi-part
-  /// [fileField] for multi-part uploads, name of the file field or 'file' by
-  /// default
-  /// [mimeType] the mimeType of the file, or derived from filename extension
-  /// by default
-  /// [fields] for multi-part uploads, optional map of name/value pairs to upload
-  ///   along with the file as form fields
-  /// [directory] optional directory name, precedes [filename]
-  /// [baseDirectory] one of the base directories, precedes [directory]
-  /// [group] if set allows different callbacks or processing for different
-  /// groups
-  /// [updates] the kind of progress updates requested
-  /// [requiresWiFi] if set, will not start upload until WiFi is available.
-  /// If not set may start upload over cellular network
-  /// [retries] if >0 will retry a failed upload this many times
-  /// [metaData] user data
-  /// [creationTime] time of task creation, 'now' by default.
-  UploadTask(
-      {super.taskId,
-      required super.url,
-      super.urlQueryParameters,
-      required String filename,
-      super.headers,
-      String? httpRequestMethod,
-      String? post,
-      this.fileField = 'file',
-      String? mimeType,
-      Map<String, String>? fields,
-      super.directory,
-      super.baseDirectory,
-      super.group,
-      super.updates,
-      super.requiresWiFi,
-      super.retries,
-      super.metaData,
-      super.creationTime})
-      : assert(filename.isNotEmpty, 'A filename is required'),
-        assert(post == null || post == 'binary',
-            'post field must be null, or "binary" for binary file upload'),
-        assert(fields == null || fields.isEmpty || post != 'binary',
-            'fields only allowed for multi-part uploads'),
-        fields = fields ?? {},
-        mimeType =
-            mimeType ?? lookupMimeType(filename) ?? 'application/octet-stream',
-        super(
-            filename: filename,
-            httpRequestMethod: httpRequestMethod ?? 'POST',
-            post: post,
-            allowPause: false);
-
-  /// Creates [UploadTask] object from JsonMap
-  UploadTask.fromJsonMap(Map<String, dynamic> jsonMap)
-      : assert(
-            ['UploadTask', 'MultiUploadTask'].contains(jsonMap['taskType']),
-            'The provided JSON map is not an UploadTask, '
-            'because key "taskType" is not "UploadTask" or "MultiUploadTask.'),
-        fileField = jsonMap['fileField'] ?? 'file',
-        mimeType = jsonMap['mimeType'] ?? 'application/octet-stream',
-        fields = Map<String, String>.from(jsonMap['fields'] ?? {}),
-        super.fromJsonMap(jsonMap);
-
-  /// Returns a list of fileData elements, one for each file to upload.
-  /// Each element is a triple containing fileField, full filePath, mimeType
-  ///
-  /// The lists are stored in the similarly named String fields as a JSON list,
-  /// with each list the same length. For the filenames list, if a filename refers
-  /// to a file that exists (i.e. it is a full path) then that is the filePath used,
-  /// otherwise the filename is appended to the [Task.baseDirectory] and [Task.directory]
-  /// to form a full file path
-  Future<List<(String, String, String)>> extractFilesData() async {
-    final List<String> fileFields = List.from(jsonDecode(fileField));
-    final List<String> filenames = List.from(jsonDecode(filename));
-    final List<String> mimeTypes = List.from(jsonDecode(mimeType));
-    final result = <(String, String, String)>[];
-    for (int i = 0; i < fileFields.length; i++) {
-      final file = File(filenames[i]);
-      if (await file.exists()) {
-        result.add((fileFields[i], filenames[i], mimeTypes[i]));
-      } else {
-        result.add(
-          (
-            fileFields[i],
-            await filePath(withFilename: filenames[i]),
-            mimeTypes[i],
-          ),
-        );
-      }
-    }
-    return result;
-  }
-
-  @override
-  Map<String, dynamic> toJsonMap() => {
-        ...super.toJsonMap(),
-        'fileField': fileField,
-        'mimeType': mimeType,
-        'fields': fields
-      };
-
-  @override
-  String get taskType => 'UploadTask';
-
-  @override
-  UploadTask copyWith(
-          {String? taskId,
-          String? url,
-          String? filename,
-          Map<String, String>? headers,
-          String? httpRequestMethod,
-          Object? post,
-          String? fileField,
-          String? mimeType,
-          Map<String, String>? fields,
-          String? directory,
-          BaseDirectory? baseDirectory,
-          String? group,
-          Updates? updates,
-          bool? requiresWiFi,
-          int? retries,
-          int? retriesRemaining,
-          bool? allowPause,
-          String? metaData,
-          DateTime? creationTime}) =>
-      UploadTask(
-          taskId: taskId ?? this.taskId,
-          url: url ?? this.url,
-          filename: filename ?? this.filename,
-          headers: headers ?? this.headers,
-          httpRequestMethod: httpRequestMethod ?? this.httpRequestMethod,
-          post: post as String? ?? this.post,
-          fileField: fileField ?? this.fileField,
-          mimeType: mimeType ?? this.mimeType,
-          fields: fields ?? this.fields,
-          directory: directory ?? this.directory,
-          baseDirectory: baseDirectory ?? this.baseDirectory,
-          group: group ?? this.group,
-          updates: updates ?? this.updates,
-          requiresWiFi: requiresWiFi ?? this.requiresWiFi,
-          retries: retries ?? this.retries,
-          metaData: metaData ?? this.metaData,
-          creationTime: creationTime ?? this.creationTime)
-        ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
-
-  @override
-  String toString() => '${super.toString()} and fileField $fileField, '
-      'mimeType $mimeType and fields $fields';
-}
-
-/// Information related to an UploadTask, containing multiple files to upload
-///
-/// An equality test on a [UploadTask] is a test on the [taskId]
-/// only - all other fields are ignored in that test
-///
-/// A [MultiUploadTask] is initialized with a list representing the files to upload.
-/// Each element is either a filename/path, or a (fileField, filename/path),
-/// or a (fileField, filename/path, mimeType).
-/// When instantiating a [MultiUploadTask], this list is converted into
-/// three lists: [fileFields], [filenames], and [mimeTypes], available
-/// as fields. These lists are also encoded to a JSON string representation in
-/// the fields [fileField], [filename] and [mimeType],so - different from
-/// a single [UploadTask] - these fields now contain a JSON object representing all
-/// files.
-/// filename/path means either a filename without directory (and the
-/// directory will be based on the [Task.baseDirectory] and [Task.directory]
-/// fields), or you specify a full file path. For example: "hello.txt" or
-/// "/data/com.myapp/data/dir/hello.txt"
-final class MultiUploadTask extends UploadTask {
-  final List<String> fileFields, filenames, mimeTypes;
-
-  static const _filesArgumentError =
-      'files must be a list of filenames, or a list of records of type '
-      '(fileField, filename) or (fileField, filename, mimeType)';
-
-  /// Creates [UploadTask]
-  ///
-  /// [taskId] must be unique. A unique id will be generated if omitted
-  /// [url] properly encoded if necessary, can include query parameters
-  /// [urlQueryParameters] may be added and will be appended to the [url], must
-  ///   be properly encoded if necessary
-  /// [files] list of objects representing each file to upload. The object must
-  ///   be either a String representing the filename/path (and the fileField will
-  ///   be the filename without extension), a Record of type
-  ///   (String fileField, String filename/path) or a Record with a third String
-  ///   for the mimeType (if omitted, mimeType will be derived from the filename
-  ///   extension).
-  ///   Each file must be based in the directory represented by the combination
-  ///   of [baseDirectory] and [directory], unless a full filepath is given
-  ///   instead of only the filename. For example: "hello.txt" or
-  ///   "/data/com.myapp/data/dir/hello.txt"
-  /// [headers] an optional map of HTTP request headers
-  /// [httpRequestMethod] the HTTP request method used (e.g. GET, POST)
-  /// [fields] optional map of name/value pairs to upload
-  ///   along with the file as form fields
-  /// [directory] optional directory name, precedes [filename]
-  /// [baseDirectory] one of the base directories, precedes [directory]
-  /// [group] if set allows different callbacks or processing for different
-  /// groups
-  /// [updates] the kind of progress updates requested
-  /// [requiresWiFi] if set, will not start upload until WiFi is available.
-  /// If not set may start upload over cellular network
-  /// [retries] if >0 will retry a failed upload this many times
-  /// [metaData] user data
-  /// [creationTime] time of task creation, 'now' by default.
-  MultiUploadTask(
-      {super.taskId,
-      required super.url,
-      super.urlQueryParameters,
-      required List<dynamic> files,
-      super.headers,
-      super.httpRequestMethod,
-      Map<String, String>? fields = const {},
-      super.directory,
-      super.baseDirectory,
-      super.group,
-      super.updates,
-      super.requiresWiFi,
-      super.retries,
-      super.metaData,
-      super.creationTime})
-      : fileFields = files
-            .map((e) => switch (e) {
-                  String filename => path.basenameWithoutExtension(filename),
-                  (String fileField, String _, String _) => fileField,
-                  (String fileField, String _) => fileField,
-                  _ => throw ArgumentError(_filesArgumentError)
-                })
-            .toList(growable: false),
-        filenames = files
-            .map((e) => switch (e) {
-                  String filename => filename,
-                  (String _, String filename, String _) => filename,
-                  (String _, String filename) => filename,
-                  _ => throw ArgumentError(_filesArgumentError)
-                })
-            .toList(growable: false),
-        mimeTypes = files
-            .map((e) => switch (e) {
-                  (String _, String _, String mimeType) => mimeType,
-                  String filename ||
-                  (String _, String filename) =>
-                    lookupMimeType(filename) ?? 'application/octet-stream',
-                  _ => throw ArgumentError(_filesArgumentError)
-                })
-            .toList(growable: false),
-        super(
-            filename: 'multi-upload',
-            fileField: '',
-            mimeType: '',
-            fields: fields);
-
-  /// For [MultiUploadTask], returns jsonEncoded list of [fileFields]
-  @override
-  String get fileField => jsonEncode(fileFields);
-
-  /// For [MultiUploadTask], returns jsonEncoded list of [filenames]
-  @override
-  String get filename => jsonEncode(filenames);
-
-  /// For [MultiUploadTask], returns jsonEncoded list of [mimeTypes]
-  @override
-  String get mimeType => jsonEncode(mimeTypes);
-
-  /// Creates [MultiUploadTask] object from JsonMap
-  MultiUploadTask.fromJsonMap(Map<String, dynamic> jsonMap)
-      : assert(
-            jsonMap['taskType'] == 'MultiUploadTask',
-            'The provided JSON map is not'
-            ' a MultiUploadTask, because key "taskType" is not "MultiUploadTask".'),
-        fileFields =
-            List.from(jsonDecode(jsonMap['fileField'] as String? ?? '[]')),
-        filenames =
-            List.from(jsonDecode(jsonMap['filename'] as String? ?? '[]')),
-        mimeTypes =
-            List.from(jsonDecode(jsonMap['mimeType'] as String? ?? '[]')),
-        super.fromJsonMap(jsonMap);
-
-  @override
-  MultiUploadTask copyWith(
-          {String? taskId,
-          String? url,
-          String? filename,
-          Map<String, String>? headers,
-          String? httpRequestMethod,
-          Object? post,
-          String? fileField,
-          String? mimeType,
-          Map<String, String>? fields,
-          String? directory,
-          BaseDirectory? baseDirectory,
-          String? group,
-          Updates? updates,
-          bool? requiresWiFi,
-          int? retries,
-          int? retriesRemaining,
-          bool? allowPause,
-          String? metaData,
-          DateTime? creationTime}) =>
-      MultiUploadTask(
-          taskId: taskId ?? this.taskId,
-          url: url ?? this.url,
-          files: fileFields.indexed.map(_toRecord).toList(),
-          headers: headers ?? this.headers,
-          httpRequestMethod: httpRequestMethod ?? this.httpRequestMethod,
-          fields: fields ?? this.fields,
-          directory: directory ?? this.directory,
-          baseDirectory: baseDirectory ?? this.baseDirectory,
-          group: group ?? this.group,
-          updates: updates ?? this.updates,
-          requiresWiFi: requiresWiFi ?? this.requiresWiFi,
-          retries: retries ?? this.retries,
-          metaData: metaData ?? this.metaData,
-          creationTime: creationTime ?? this.creationTime)
-        ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
-
-  /// Zips the fileField, filename and mimeType at an index to
-  /// a record
-  (String, String, String) _toRecord((int, String) record) =>
-      (fileFields[record.$1], filenames[record.$1], mimeTypes[record.$1]);
-
-  @override
-  String get taskType => 'MultiUploadTask';
-}
-
-/// Return url String composed of the [url] and the
-/// [urlQueryParameters], if given
-String _urlWithQueryParameters(
-    String url, Map<String, String>? urlQueryParameters) {
-  if (urlQueryParameters == null || urlQueryParameters.isEmpty) {
-    return url;
-  }
-  final separator = url.contains('?') ? '&' : '?';
-  return '$url$separator${urlQueryParameters.entries.map((e) => '${e.key}=${e.value}').join('&')}';
-}
 
 /// Signature for a function you can provide to the [downloadBatch] or
 /// [uploadBatch] that will be called upon completion of each task
@@ -1095,44 +186,69 @@ sealed class TaskUpdate {
 
   const TaskUpdate(this.task);
 
-  /// Create object from JSON Map
-  TaskUpdate.fromJsonMap(Map<String, dynamic> jsonMap)
-      : task = Task.createFromJsonMap(jsonMap);
+  /// Create object from [json]
+  TaskUpdate.fromJson(Map<String, dynamic> json)
+      : task = Task.createFromJson(json['task'] ?? json);
 
   /// Return JSON Map representing object
-  Map<String, dynamic> toJsonMap() => task.toJsonMap();
+  Map<String, dynamic> toJson() => {'task': task.toJson()};
 }
 
 /// A status update
 ///
 /// Contains [TaskStatus] and, if [TaskStatus.failed] possibly a
-/// [TaskException] and [responseBody]
+/// [TaskException] and if this is a final state possibly a [responseBody],
+/// [mimeType] and [charSet]
 class TaskStatusUpdate extends TaskUpdate {
   final TaskStatus status;
   final TaskException? exception;
   final String? responseBody;
+  final String? mimeType; // derived from Content-Type header
+  final String? charSet; // derived from Content-Type header
 
   const TaskStatusUpdate(super.task, this.status,
-      [this.exception, this.responseBody]);
+      [this.exception, this.responseBody, this.mimeType, this.charSet]);
 
-  /// Create object from JSON Map
-  TaskStatusUpdate.fromJsonMap(Map<String, dynamic> jsonMap)
-      : status =
-            TaskStatus.values[(jsonMap['taskStatus'] as num?)?.toInt() ?? 0],
-        exception = jsonMap['exception'] != null
-            ? TaskException.fromJsonMap(jsonMap['exception'])
+  /// Create object from [json]
+  TaskStatusUpdate.fromJson(super.json)
+      : status = TaskStatus.values[(json['taskStatus'] as num?)?.toInt() ?? 0],
+        exception = json['exception'] != null
+            ? TaskException.fromJson(json['exception'])
             : null,
-        responseBody = jsonMap['responseBody'],
-        super.fromJsonMap(jsonMap);
+        responseBody = json['responseBody'],
+        mimeType = json['mimeType'],
+        charSet = json['charSet'],
+        super.fromJson();
+
+  /// Create object from [jsonString]
+  factory TaskStatusUpdate.fromJsonString(String jsonString) =>
+      TaskStatusUpdate.fromJson(jsonDecode(jsonString));
 
   /// Return JSON Map representing object
   @override
-  Map<String, dynamic> toJsonMap() => {
-        ...super.toJsonMap(),
+  Map<String, dynamic> toJson() => {
+        ...super.toJson(),
         'taskStatus': status.index,
-        'exception': exception?.toJsonMap(),
-        'responseBody': responseBody
+        'exception': exception?.toJson(),
+        'responseBody': responseBody,
+        'mimeType': mimeType,
+        'charSet': charSet
       };
+
+  TaskStatusUpdate copyWith(
+          {Task? task,
+          TaskStatus? status,
+          TaskException? exception,
+          String? responseBody,
+          String? mimeType,
+          String? charSet}) =>
+      TaskStatusUpdate(
+          task ?? this.task,
+          status ?? this.status,
+          exception ?? this.exception,
+          responseBody ?? this.responseBody,
+          mimeType ?? this.mimeType,
+          charSet ?? this.charSet);
 }
 
 /// A progress update
@@ -1163,19 +279,23 @@ class TaskProgressUpdate extends TaskUpdate {
       this.networkSpeed = -1,
       this.timeRemaining = const Duration(seconds: -1)]);
 
-  /// Create object from JSON Map
-  TaskProgressUpdate.fromJsonMap(Map<String, dynamic> jsonMap)
-      : progress = (jsonMap['progress'] as num?)?.toDouble() ?? progressFailed,
-        expectedFileSize = (jsonMap['expectedFileSize'] as num?)?.toInt() ?? -1,
-        networkSpeed = (jsonMap['networkSpeed'] as num?)?.toDouble() ?? -1,
-        timeRemaining = Duration(
-            seconds: (jsonMap['timeRemaining'] as num?)?.toInt() ?? -1),
-        super.fromJsonMap(jsonMap);
+  /// Create object from [json]
+  TaskProgressUpdate.fromJson(super.json)
+      : progress = (json['progress'] as num?)?.toDouble() ?? progressFailed,
+        expectedFileSize = (json['expectedFileSize'] as num?)?.toInt() ?? -1,
+        networkSpeed = (json['networkSpeed'] as num?)?.toDouble() ?? -1,
+        timeRemaining =
+            Duration(seconds: (json['timeRemaining'] as num?)?.toInt() ?? -1),
+        super.fromJson();
+
+  /// Create object from [jsonString]
+  factory TaskProgressUpdate.fromJsonString(String jsonString) =>
+      TaskProgressUpdate.fromJson(jsonDecode(jsonString));
 
   /// Return JSON Map representing object
   @override
-  Map<String, dynamic> toJsonMap() => {
-        ...super.toJsonMap(),
+  Map<String, dynamic> toJson() => {
+        ...super.toJson(),
         'progress': progress,
         'expectedFileSize': expectedFileSize,
         'networkSpeed': networkSpeed,
@@ -1215,6 +335,7 @@ class TaskProgressUpdate extends TaskUpdate {
 }
 
 // Progress values representing a status
+const progressRunning = 0.0;
 const progressComplete = 1.0;
 const progressFailed = -1.0;
 const progressCanceled = -2.0;
@@ -1232,17 +353,20 @@ class ResumeData {
   const ResumeData(this.task, this.data,
       [this.requiredStartByte = 0, this.eTag]);
 
-  /// Create object from JSON Map
-  ResumeData.fromJsonMap(Map<String, dynamic> jsonMap)
-      : task = Task.createFromJsonMap(jsonMap['task']),
-        data = jsonMap['data'] as String,
-        requiredStartByte =
-            (jsonMap['requiredStartByte'] as num?)?.toInt() ?? 0,
-        eTag = jsonMap['eTag'] as String?;
+  /// Create object from [json]
+  ResumeData.fromJson(Map<String, dynamic> json)
+      : task = Task.createFromJson(json['task']),
+        data = json['data'] as String,
+        requiredStartByte = (json['requiredStartByte'] as num?)?.toInt() ?? 0,
+        eTag = json['eTag'] as String?;
+
+  /// Create object from [jsonString]
+  factory ResumeData.fromJsonString(String jsonString) =>
+      ResumeData.fromJson(jsonDecode(jsonString));
 
   /// Return JSON Map representing object
-  Map<String, dynamic> toJsonMap() => {
-        'task': task.toJsonMap(),
+  Map<String, dynamic> toJson() => {
+        'task': task.toJson(),
         'data': data,
         'requiredStartByte': requiredStartByte,
         'eTag': eTag
@@ -1296,7 +420,7 @@ final class TaskNotification {
   const TaskNotification(this.title, this.body);
 
   /// Return JSON Map representing object
-  Map<String, dynamic> toJsonMap() => {"title": title, "body": body};
+  Map<String, dynamic> toJson() => {"title": title, "body": body};
 }
 
 /// Notification configuration object
@@ -1307,6 +431,20 @@ final class TaskNotification {
 /// [complete] is the notification used when the task completed
 /// [error] is the notification used when something went wrong,
 /// including pause, failed and notFound status
+/// [progressBar] if set will show a progress bar
+/// [tapOpensFile] if set will attempt to open the file when the [complete]
+///     notification is tapped
+/// [groupNotificationId] if set will group all notifications with the same
+///    [groupNotificationId] and change the progress bar to number of finished
+///    tasks versus total number of tasks in the groupNotification.
+///    Use {finished} and {total} tokens in the [TaskNotification.title] and
+///    [TaskNotification.body] to substitute. Task-specific substitutions
+///    such as {filename} are not valid.
+///    The groupNotification is considered [complete] when there are no
+///    more tasks running within that group, and at that point the
+///    [complete] notification is shown (if configured). If any task in the
+///    groupNotification fails, the [error] notification is shown.
+///    The first character of the [groupNotificationId] cannot be '*'.
 final class TaskNotificationConfig {
   final dynamic taskOrGroup;
   final TaskNotification? running;
@@ -1315,6 +453,7 @@ final class TaskNotificationConfig {
   final TaskNotification? paused;
   final bool progressBar;
   final bool tapOpensFile;
+  final String groupNotificationId;
 
   /// Create notification configuration that determines what notifications are shown,
   /// whether a progress bar is shown (Android only), and whether tapping
@@ -1324,6 +463,20 @@ final class TaskNotificationConfig {
   /// [complete] is the notification used when the task completed
   /// [error] is the notification used when something went wrong,
   /// including pause, failed and notFound status
+  /// [progressBar] if set will show a progress bar
+  /// [tapOpensFile] if set will attempt to open the file when the [complete]
+  ///     notification is tapped
+  /// [groupNotificationId] if set will group all notifications with the same
+  ///    [groupNotificationId] and change the progress bar to number of finished
+  ///    tasks versus total number of tasks in the groupNotification.
+  ///    Use {numFinished}, {numFailed} and {numTotal} tokens in the [TaskNotification.title]
+  ///    and [TaskNotification.body] to substitute. Task-specific substitutions
+  ///    such as {filename} are not valid.
+  ///    The groupNotification is considered [complete] when there are no
+  ///    more tasks running within that group, and at that point the
+  ///    [complete] notification is shown (if configured). If any task in the
+  ///    groupNotification fails, the [error] notification is shown.
+  ///    The first character of the [groupNotificationId] cannot be '*'.
   TaskNotificationConfig(
       {this.taskOrGroup,
       this.running,
@@ -1331,7 +484,8 @@ final class TaskNotificationConfig {
       this.error,
       this.paused,
       this.progressBar = false,
-      this.tapOpensFile = false}) {
+      this.tapOpensFile = false,
+      this.groupNotificationId = ''}) {
     assert(
         running != null || complete != null || error != null || paused != null,
         'At least one notification must be set');
@@ -1339,13 +493,14 @@ final class TaskNotificationConfig {
 
   /// Return JSON Map representing object, excluding the [taskOrGroup] field,
   /// as the JSON map is only required to pass along the config with a task
-  Map<String, dynamic> toJsonMap() => {
-        'running': running?.toJsonMap(),
-        'complete': complete?.toJsonMap(),
-        'error': error?.toJsonMap(),
-        'paused': paused?.toJsonMap(),
+  Map<String, dynamic> toJson() => {
+        'running': running?.toJson(),
+        'complete': complete?.toJson(),
+        'error': error?.toJson(),
+        'paused': paused?.toJson(),
         'progressBar': progressBar,
-        'tapOpensFile': tapOpensFile
+        'tapOpensFile': tapOpensFile,
+        'groupNotificationId': groupNotificationId
       };
 }
 
@@ -1383,11 +538,12 @@ final class Config {
       'runInForegroundIfFileLargerThan';
   static const localize = 'localize';
   static const useCacheDir = 'useCacheDir';
+  static const useExternalStorage = 'useExternalStorage';
 
   // Config arguments
-  static const always = 'always'; // int 0
-  static const never = 'never'; // int -1
-  static const whenAble = 'whenAble'; // int -2
+  static const always = 'always'; // int 0 on native side
+  static const never = 'never'; // int -1 on native side
+  static const whenAble = 'whenAble'; // int -2 on native side
 
   /// Returns the int equivalent of commonly used String arguments
   ///

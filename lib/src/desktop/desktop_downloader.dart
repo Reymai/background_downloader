@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:math';
 
 import 'package:async/async.dart';
+import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -13,11 +13,14 @@ import 'package:logging/logging.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
-import 'base_downloader.dart';
-import 'desktop_downloader_isolate.dart';
-import 'exceptions.dart';
-import 'file_downloader.dart';
-import 'models.dart';
+import '../base_downloader.dart';
+import '../chunk.dart';
+import '../exceptions.dart';
+import '../file_downloader.dart';
+import '../models.dart';
+import '../task.dart';
+import '../utils.dart';
+import 'isolate.dart';
 
 const okResponses = [200, 201, 202, 203, 204, 205, 206];
 
@@ -28,9 +31,9 @@ const okResponses = [200, 201, 202, 203, 204, 205, 206];
 /// WorkManager as there is on iOS and Android
 final class DesktopDownloader extends BaseDownloader {
   static final _log = Logger('DesktopDownloader');
-  final maxConcurrent = 5;
+  final maxConcurrent = 10;
   static final DesktopDownloader _singleton = DesktopDownloader._internal();
-  final _queue = Queue<Task>();
+  final _queue = PriorityQueue<Task>();
   final _running = Queue<Task>(); // subset that is running
   final _resume = <Task>{};
   final _isolateSendPorts =
@@ -84,19 +87,14 @@ final class DesktopDownloader extends BaseDownloader {
     }
     final isResume = _resume.remove(task) && resumeData != null;
     final filePath = await task.filePath(); // "" for MultiUploadTask
-    final tempFilePath = isResume
-        ? resumeData.tempFilepath // always non-null
-        : path.join((await getTemporaryDirectory()).path,
-            'com.bbflight.background_downloader${Random().nextInt(1 << 32).toString()}');
-    final requiredStartByte =
-        resumeData?.requiredStartByte ?? 0; // start for resume
-    final eTag = resumeData?.eTag;
     // spawn an isolate to do the task
     final receivePort = ReceivePort();
     final errorPort = ReceivePort();
     errorPort.listen((message) {
       final exceptionDescription = (message as List).first as String;
+      final stackTrace = message.last;
       logError(task, exceptionDescription);
+      log.fine('Stack trace: $stackTrace');
       processStatusUpdate(TaskStatusUpdate(
           task, TaskStatus.failed, TaskException(exceptionDescription)));
       receivePort.close(); // also ends listener at the end
@@ -107,6 +105,7 @@ final class DesktopDownloader extends BaseDownloader {
           TaskException('Could not obtain rootIsolateToken')));
       return;
     }
+    log.finer('${isResume ? "Resuming" : "Starting"} taskId ${task.taskId}');
     await Isolate.spawn(doTask, (rootIsolateToken, receivePort.sendPort),
         onError: errorPort.sendPort);
     final messagesFromIsolate = StreamQueue<dynamic>(receivePort);
@@ -114,9 +113,7 @@ final class DesktopDownloader extends BaseDownloader {
     sendPort.send((
       task,
       filePath,
-      tempFilePath,
-      requiredStartByte,
-      eTag,
+      resumeData,
       isResume,
       requestTimeout,
       proxy,
@@ -126,8 +123,12 @@ final class DesktopDownloader extends BaseDownloader {
       // if already registered with null value, cancel immediately
       sendPort.send('cancel');
     }
-    _isolateSendPorts[task] = sendPort; // allows future cancellation
-    // listen for events sent back from the isolate
+    // store the isolate's sendPort so we can send it messages for
+    // cancellation, and for managing parallel downloads
+    _isolateSendPorts[task] = sendPort;
+    // listen for messages sent back from the isolate, until 'done'
+    // note that the task sent by the isolate may have changed. Therefore, we
+    // use updatedTask instead of task from here on
     while (await messagesFromIsolate.hasNext) {
       final message = await messagesFromIsolate.next;
       switch (message) {
@@ -135,32 +136,62 @@ final class DesktopDownloader extends BaseDownloader {
           receivePort.close();
 
         case (
+            'statusUpdate',
+            Task updatedTask,
+            TaskStatus status,
+            TaskException? exception,
+            String? responseBody,
+            String? mimeType,
+            String? charSet
+          ):
+          final taskStatusUpdate = TaskStatusUpdate(
+              updatedTask, status, exception, responseBody, mimeType, charSet);
+          if (updatedTask.group != BaseDownloader.chunkGroup) {
+            if (status.isFinalState) {
+              _remove(updatedTask);
+            }
+            processStatusUpdate(taskStatusUpdate);
+          } else {
+            _parallelTaskSendPort(Chunk.getParentTaskId(updatedTask))
+                ?.send(taskStatusUpdate);
+          }
+
+        case (
             'progressUpdate',
+            Task updatedTask,
             double progress,
             int expectedFileSize,
             double downloadSpeed,
             Duration timeRemaining
           ):
-          processProgressUpdate(TaskProgressUpdate(
-              task, progress, expectedFileSize, downloadSpeed, timeRemaining));
+          final taskProgressUpdate = TaskProgressUpdate(updatedTask, progress,
+              expectedFileSize, downloadSpeed, timeRemaining);
+          if (updatedTask.group != BaseDownloader.chunkGroup) {
+            processProgressUpdate(taskProgressUpdate);
+          } else {
+            _parallelTaskSendPort(Chunk.getParentTaskId(updatedTask))
+                ?.send(taskProgressUpdate);
+          }
 
         case ('taskCanResume', bool taskCanResume):
           setCanResume(task, taskCanResume);
 
-        case (
-            'statusUpdate',
-            TaskStatus status,
-            TaskException? exception,
-            String? responseBody
-          ):
-          if (status.isFinalState) {
-            _remove(task);
-          }
-          processStatusUpdate(TaskStatusUpdate(task, status,
-              status == TaskStatus.failed ? exception : null, responseBody));
-
         case ('resumeData', String data, int requiredStartByte, String? eTag):
           setResumeData(ResumeData(task, data, requiredStartByte, eTag));
+
+        // from [ParallelDownloadTask]
+        case ('enqueueChild', DownloadTask childTask):
+          await FileDownloader().enqueue(childTask);
+
+        // from [ParallelDownloadTask]
+        case ('cancelTasksWithId', List<String> taskIds):
+          await FileDownloader().cancelTasksWithIds(taskIds);
+
+        // from [ParallelDownloadTask]
+        case ('pauseTasks', List<DownloadTask> tasks):
+          for (final chunkTask in tasks) {
+            await FileDownloader().pause(chunkTask);
+          }
 
         case ('log', String logMessage):
           _log.finest(logMessage);
@@ -174,11 +205,45 @@ final class DesktopDownloader extends BaseDownloader {
     _isolateSendPorts.remove(task);
   }
 
+  // intercept the status and progress updates for tasks that are 'chunks', i.e.
+  // part of a [ParallelDownloadTask]. Updates for these tasks are sent to the
+  // isolate running the [ParallelDownloadTask] instead
+
+  @override
+  void processStatusUpdate(TaskStatusUpdate update) {
+    // Regular update if task's group is not chunkGroup
+    if (update.task.group != FileDownloader.chunkGroup) {
+      return super.processStatusUpdate(update);
+    }
+    // If chunkGroup, send update to task's parent isolate.
+    // The task's metadata contains taskId of parent
+    _parallelTaskSendPort(Chunk.getParentTaskId(update.task))?.send(update);
+  }
+
+  @override
+  void processProgressUpdate(TaskProgressUpdate update) {
+    // Regular update if task's group is not chunkGroup
+    if (update.task.group != FileDownloader.chunkGroup) {
+      return super.processProgressUpdate(update);
+    }
+    // If chunkGroup, send update to task's parent isolate.
+    // The task's metadata contains taskId of parent
+    _parallelTaskSendPort(Chunk.getParentTaskId(update.task))?.send(update);
+  }
+
+  /// Return the [SendPort] for the [ParallelDownloadTask] represented by [taskId]
+  /// or null if not a [ParallelDownloadTask] or not found
+  SendPort? _parallelTaskSendPort(String taskId) => _isolateSendPorts.entries
+      .firstWhereOrNull((entry) =>
+          entry.key is ParallelDownloadTask && entry.key.taskId == taskId)
+      ?.value;
+
   @override
   Future<int> reset(String group) async {
     final retryAndPausedTaskCount = await super.reset(group);
-    final inQueueIds =
-        _queue.where((task) => task.group == group).map((task) => task.taskId);
+    final inQueueIds = _queue.unorderedElements
+        .where((task) => task.group == group)
+        .map((task) => task.taskId);
     final runningIds = _running
         .where((task) => task.group == group)
         .map((task) => task.taskId);
@@ -194,7 +259,8 @@ final class DesktopDownloader extends BaseDownloader {
       String group, bool includeTasksWaitingToRetry) async {
     final retryAndPausedTasks =
         await super.allTasks(group, includeTasksWaitingToRetry);
-    final inQueue = _queue.where((task) => task.group == group);
+    final inQueue =
+        _queue.unorderedElements.where((task) => task.group == group);
     final running = _running.where((task) => task.group == group);
     return [...retryAndPausedTasks, ...inQueue, ...running];
   }
@@ -204,7 +270,7 @@ final class DesktopDownloader extends BaseDownloader {
   /// Returns true if all cancellations were successful
   @override
   Future<bool> cancelPlatformTasksWithIds(List<String> taskIds) async {
-    final inQueue = _queue
+    final inQueue = _queue.unorderedElements
         .where((task) => taskIds.contains(task.taskId))
         .toList(growable: false);
     for (final task in inQueue) {
@@ -236,7 +302,9 @@ final class DesktopDownloader extends BaseDownloader {
       return _running.where((task) => task.taskId == taskId).first;
     } on StateError {
       try {
-        return _queue.where((task) => task.taskId == taskId).first;
+        return _queue.unorderedElements
+            .where((task) => task.taskId == taskId)
+            .first;
       } on StateError {
         return null;
       }
@@ -256,23 +324,28 @@ final class DesktopDownloader extends BaseDownloader {
   @override
   Future<bool> resume(Task task) async {
     if (await super.resume(task)) {
+      task = awaitTasks.containsKey(task)
+          ? awaitTasks.keys
+              .firstWhere((awaitTask) => awaitTask.taskId == task.taskId)
+          : task;
       _resume.add(task);
-      return enqueue(task);
+      if (await enqueue(task)) {
+        if (task is ParallelDownloadTask) {
+          final resumeData = await getResumeData(task.taskId);
+          if (resumeData == null) {
+            return false;
+          }
+          return resumeChunkTasks(task, resumeData);
+        }
+        return true;
+      }
     }
     return false;
   }
 
   @override
-  Future<Map<String, dynamic>> popUndeliveredData(Undelivered dataType) =>
+  Future<Map<String, String>> popUndeliveredData(Undelivered dataType) =>
       Future.value({});
-
-  @override
-  Future<Duration> getTaskTimeout() => Future.value(const Duration(days: 1));
-
-  @override
-  Future<void> setForceFailPostOnBackgroundChannel(bool value) {
-    throw UnimplementedError();
-  }
 
   @override
   Future<String?> moveToSharedStorage(String filePath,
@@ -350,6 +423,24 @@ final class DesktopDownloader extends BaseDownloader {
           'openFile command $executable returned exit code ${result.exitCode}');
     }
     return result.exitCode == 0;
+  }
+
+  @override
+  Future<Duration> getTaskTimeout() => Future.value(const Duration(days: 1));
+
+  @override
+  Future<void> setForceFailPostOnBackgroundChannel(bool value) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<String> testSuggestedFilename(
+      DownloadTask task, String contentDisposition) async {
+    final h = contentDisposition.isNotEmpty
+        ? {'Content-disposition': contentDisposition}
+        : <String, String>{};
+    final t = await taskWithSuggestedFilename(task, h, false);
+    return t.filename;
   }
 
   @override

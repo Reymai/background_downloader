@@ -5,7 +5,6 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
-import 'package:background_downloader/src/persistent_storage.dart';
 import 'package:background_downloader/src/localstore/localstore.dart';
 
 const def = 'default';
@@ -56,7 +55,7 @@ void main() {
     expect(records.values.length, equals(1));
     final storedRecordJsonMap = records.values.first;
     expect(storedRecordJsonMap, isNotNull);
-    final storedRecord = TaskRecord.fromJsonMap(storedRecordJsonMap);
+    final storedRecord = TaskRecord.fromJson(storedRecordJsonMap);
     expect(storedRecord, equals(record));
     await database.updateRecord(record2);
     final records2 = await db.retrieveAll(tasksPath);

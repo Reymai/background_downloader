@@ -22,8 +22,16 @@ func providesStatusUpdates(downloadTask: Task) -> Bool {
 }
 
 /// True if this task is a DownloadTask, false if not
+///
+/// A ParallelDownloadTask is also a DownloadTask
 func isDownloadTask(task: Task) -> Bool {
-    return task.taskType == "DownloadTask"
+    return task.taskType == "DownloadTask" || task.taskType == "ParallelDownloadTask"
+}
+
+/// True if this task is a ParallelDownloadTask, false if not
+func isParallelDownloadTask(task: Task) -> Bool
+{
+    return task.taskType == "ParallelDownloadTask"
 }
 
 /// True if this task is an UploadTask, false if not
@@ -70,6 +78,173 @@ func getFilePath(for task: Task, withFilename: String? = nil) -> String? {
     return directory.appendingPathComponent(withFilename ?? task.filename).path
 }
 
+func stripFileExtension ( _ filename: String ) -> String {
+    var components = filename.components(separatedBy: ".")
+    guard components.count > 1 else { return filename }
+    components.removeLast()
+    return components.joined(separator: ".")
+}
+
+/**
+ * Returns a copy of the task with the [Task.filename] property changed
+ * to the filename suggested by the server, or derived from the url, or
+ * unchanged.
+ *
+ * If [unique] is true, the filename is guaranteed not to already exist. This
+ * is accomplished by adding a suffix to the suggested filename with a number,
+ * e.g. "data (2).txt"
+ *
+ * The server-suggested filename is obtained from the  [responseHeaders] entry
+ * "Content-Disposition"
+ */
+func suggestedFilenameFromResponseHeaders(
+    task: Task,
+    responseHeaders: [AnyHashable: Any],
+    unique: Bool = false
+) -> Task {
+    if let disposition = responseHeaders["Content-Disposition"] as? String {
+        let range = NSMakeRange(0, disposition.utf16.count)
+        // Try filename*=UTF-8'language'"encodedFilename"
+        let encodedFilenameRegEx = try! NSRegularExpression(pattern: #"filename\*=\s*([^']+)'([^']*)'"?([^"]+)"?"#, options: .caseInsensitive)
+        if let match = encodedFilenameRegEx.firstMatch(in: disposition, options: [], range: range) {
+            let encoding = String(disposition[Range(match.range(at: 1), in: disposition)!]).uppercased()
+            let filename = String(disposition[Range(match.range(at: 3), in: disposition)!])
+            if encoding == "UTF-8" {
+                if let decodedFilename = filename.removingPercentEncoding {
+                    return uniqueFilename(task: task.copyWith(filename: decodedFilename), unique: unique)
+                } else {
+                    os_log("Could not interpret suggested filename (UTF-8 url encoded)", log: log, type: .debug)
+                }
+            } else {
+                return uniqueFilename(task: task.copyWith(filename: filename), unique: unique)
+            }
+        }
+        // Try filename="filename"
+        let plainFilenameRegEx = try! NSRegularExpression(pattern: #"filename=\s*"?([^"]+)"?.*$"#, options: .caseInsensitive)
+        if let match = plainFilenameRegEx.firstMatch(in: disposition, options: [], range: range) {
+            let filename = String(disposition[Range(match.range(at: 1), in: disposition)!])
+            return uniqueFilename(task: task.copyWith(filename: filename), unique: unique)
+        }
+    }
+    os_log("Could not determine suggested filename from server", log: log, type: .debug)
+    // Try filename derived from last path segment of the url
+    if let uri = URL(string: task.url) {
+        let suggestedFilename = uri.lastPathComponent
+        if !suggestedFilename.isEmpty {
+            return uniqueFilename(task: task.copyWith(filename: suggestedFilename), unique: unique)
+        }
+    }
+    os_log("Could not parse URL pathSegment for suggested filename", log: log, type: .debug)
+    // if everything fails, return the task with unchanged filename
+    // except for possibly making it unique
+    return uniqueFilename(task: task, unique: unique)
+}
+
+/// Returns [Task] with a filename similar to the one
+/// supplied, but unused.
+///
+/// If [unique], filename will sequence up in "filename (8).txt" format,
+/// otherwise returns the [task]
+func uniqueFilename(task: Task, unique: Bool) -> Task {
+    if !unique {
+        return task
+    }
+    let sequenceRegEx = try! NSRegularExpression(pattern: #"\((\d+)\)\.?[^.]*$"#)
+    let extensionRegEx = try! NSRegularExpression(pattern: #"\.[^.]*$"#)
+    var newTask = task
+    guard let filePath = getFilePath(for: task) else {
+        return task
+    }
+    var exists = FileManager.default.fileExists(atPath: filePath)
+    
+    while exists {
+        let range = NSMakeRange(0, newTask.filename.utf16.count)
+        let extMatch = extensionRegEx.firstMatch(in: newTask.filename, options: [], range: range)
+        let extString = extMatch != nil ? String(newTask.filename[Range(extMatch!.range, in: newTask.filename)!]) : ""
+        let seqMatch = sequenceRegEx.firstMatch(in: newTask.filename, options: [], range: range)
+        let seqString = seqMatch != nil ? String(newTask.filename[Range(seqMatch!.range, in: newTask.filename)!]) : ""
+        let newSequence = seqString.isEmpty ? 1 : Int(seqString)! + 1
+        
+        let newFilename: String
+        if seqMatch == nil {
+            let baseNameWithoutExtension = stripFileExtension(newTask.filename)
+            newFilename = "\(baseNameWithoutExtension) (\(newSequence))\(extString)"
+        } else {
+            let startOfSeq = seqMatch!.range.location
+            let index = newTask.filename.index(newTask.filename.startIndex, offsetBy: startOfSeq)
+            newFilename = "\(newTask.filename.prefix(upTo: index)) (\(newSequence))\(extString)"
+        }
+        newTask = newTask.copyWith(filename: newFilename)
+        guard let filePath = getFilePath(for: task) else {
+            return task
+        }
+        exists = FileManager.default.fileExists(atPath: filePath)
+    }
+    return newTask
+}
+
+/**
+ * Parses the range in a Range header, and returns a Pair representing
+ * the range. The format needs to be "bytes=10-20"
+ *
+ * A missing lower range is substituted with 0L, and a missing upper
+ * range with null.  If the string cannot be parsed, returns (0L, null)
+ */
+func parseRange(rangeStr: String) -> (Int64, Int64?) {
+    let regex = try! NSRegularExpression(pattern: #"bytes=(\d*)-(\d*)"#)
+    let range = NSMakeRange(0, rangeStr.utf16.count)
+    if let match = regex.firstMatch(in: rangeStr, options: [], range: range) {
+        let start = Int64(String(rangeStr[Range(match.range(at: 1), in: rangeStr)!]))
+        let end = Int64(String(rangeStr[Range(match.range(at: 2), in: rangeStr)!]))
+        return (start!, end!)
+    } else {
+        return (0, nil)
+    }
+}
+
+/// Returns the content length extracted from the [responseHeaders], or from
+/// the [task] headers
+func getContentLength(responseHeaders: [AnyHashable: Any], task: Task) -> Int64 {
+    // On iOS, the header has already been parsed for Content-Length so we don't need to
+    // repeat that here
+    // try extracting it from Range header
+    let taskRangeHeader = task.headers["Range"] ?? ""
+    let taskRange = parseRange(rangeStr: taskRangeHeader)
+    if let end = taskRange.1 {
+        let rangeLength = end - taskRange.0 + 1
+        os_log("TaskId %@ contentLength set to %d based on Range header", log: log, type: .info, task.taskId, rangeLength)
+        return rangeLength
+    }
+    
+    // try extracting it from a special "Known-Content-Length" header
+    let knownLength = Int64(task.headers["Known-Content-Length"] ?? "-1") ?? -1
+    if knownLength != -1 {
+        os_log("TaskId %@ contentLength set to %d based on Known-Content-Length header", log: log, type: .info, task.taskId, knownLength)
+    } else {
+        os_log("TaskId %@ contentLength undetermined", log: log, type: .info, task.taskId)
+    }
+    return knownLength
+}
+
+/// Sets the mimeType and charSet extracted from the Content-Type header
+/// in [responseHeaders] and stores in static maps keyed by [task.taskId]
+func extractContentType(responseHeaders: [AnyHashable: Any], task: Task)  {
+    guard let contentType = responseHeaders["Content-Type"] as? String else { return }
+    let regEx = try! NSRegularExpression(pattern: #"(.*);\s*charset\s*=(.*)"#)
+    let range = NSMakeRange(0, contentType.utf16.count)
+    let match = regEx.firstMatch(in: contentType, options: [], range: range)
+    if let match = match {
+        let mimeType = String(contentType[Range(match.range(at: 1), in: contentType)!])
+        let charSet = String(contentType[Range(match.range(at: 2), in: contentType)!])
+        BDPlugin.mimeTypes[task.taskId] = mimeType
+        BDPlugin.charSets[task.taskId] = charSet
+    } else {
+        BDPlugin.mimeTypes[task.taskId] = contentType
+    }
+}
+
+
+
 /// Returns a list of fileData elements, one for each file to upload.
 /// Each element is a triple containing fileField, full filePath, mimeType
 ///
@@ -103,13 +278,34 @@ func extractFilesData(task: Task) -> [((String, String, String))] {
     return result
 }
 
+/// Calculate progress, network speed and time remaining, and send this at an appropriate
+/// interval to the Dart side
+func updateProgress(task: Task, totalBytesExpected: Int64, totalBytesDone: Int64) {
+    let info = BDPlugin.progressInfo[task.taskId] ?? (lastProgressUpdateTime: 0.0, lastProgressValue: 0.0, lastTotalBytesDone: 0, lastNetworkSpeed: -1.0)
+    if totalBytesExpected != NSURLSessionTransferSizeUnknown && Date().timeIntervalSince1970 > info.lastProgressUpdateTime + 0.5 {
+        let progress = min(Double(totalBytesDone) / Double(totalBytesExpected), 0.999)
+        if progress - info.lastProgressValue > 0.02 {
+            // calculate network speed and time remaining
+            let now = Date().timeIntervalSince1970
+            let timeSinceLastUpdate = now - info.lastProgressUpdateTime
+            let bytesSinceLastUpdate = totalBytesDone - info.lastTotalBytesDone
+            let currentNetworkSpeed: Double = timeSinceLastUpdate > 3600 ? -1.0 : Double(bytesSinceLastUpdate) / timeSinceLastUpdate / 1000000.0
+            let newNetworkSpeed = info.lastNetworkSpeed == -1.0 ? currentNetworkSpeed : (info.lastNetworkSpeed * 3.0 + currentNetworkSpeed) / 4.0
+            let remainingBytes = (1.0 - progress) * Double(totalBytesExpected)
+            let timeRemaining: TimeInterval = newNetworkSpeed == -1.0 ? -1.0 : (remainingBytes / newNetworkSpeed / 1000000.0)
+            BDPlugin.progressInfo[task.taskId] = (lastProgressUpdateTime: now, lastProgressValue: progress, lastTotalBytesDone: totalBytesDone, lastNetworkSpeed: newNetworkSpeed)
+            processProgressUpdate(task: task, progress: progress, expectedFileSize: totalBytesExpected, networkSpeed: newNetworkSpeed, timeRemaining: timeRemaining)
+        }
+    }
+}
+
 
 /// Processes a change in status for the task
 ///
 /// Sends status update via the background channel to Dart, if requested
 /// If the task is finished, processes a final progressUpdate update and removes
 /// task from persistent storage
-func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil, responseBody: String? = nil) {
+func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil, responseBody: String? = nil, mimeType: String? = nil, charSet: String? = nil) {
     // Post update if task expects one, or if failed and retry is needed
     let retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0
     // if task is in final state, process a final progressUpdate
@@ -117,45 +313,48 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
     // a retry is not needed: if it is needed, a `waitingToRetry` progress update
     // will be generated on the Dart side
     switch (status) {
-    case .complete:
-        processProgressUpdate(task: task, progress: 1.0)
-    case .failed:
-        if !retryNeeded {
-            processProgressUpdate(task: task, progress: -1.0)
-        }
-    case .canceled:
-        processProgressUpdate(task: task, progress: -2.0)
-    case .notFound:
-        processProgressUpdate(task: task, progress: -3.0)
-    case .paused:
-        processProgressUpdate(task: task, progress: -5.0)
-    default:
-        break
+        case .complete:
+            processProgressUpdate(task: task, progress: 1.0)
+        case .failed:
+            if !retryNeeded {
+                processProgressUpdate(task: task, progress: -1.0)
+            }
+        case .canceled:
+            processProgressUpdate(task: task, progress: -2.0)
+        case .notFound:
+            processProgressUpdate(task: task, progress: -3.0)
+        case .paused:
+            processProgressUpdate(task: task, progress: -5.0)
+        default:
+            break
     }
     
     if providesStatusUpdates(downloadTask: task) || retryNeeded {
         let finalTaskException = taskException == nil
-            ? TaskException(type: .general, httpResponseCode: -1, description: "")
-            : taskException
+        ? TaskException(type: .general, httpResponseCode: -1, description: "")
+        : taskException
         let arg: [Any?] = status == .failed
-            ? [status.rawValue, finalTaskException!.type.rawValue, finalTaskException!.description, finalTaskException!.httpResponseCode, responseBody] as [Any?]
-            : [status.rawValue, responseBody] as [Any?]
+        ? [status.rawValue, finalTaskException!.type.rawValue, finalTaskException!.description, finalTaskException!.httpResponseCode, responseBody] as [Any?]
+        : [status.rawValue, responseBody, mimeType, charSet] as [Any?]
         if !postOnBackgroundChannel(method: "statusUpdate", task: task, arg: arg) {
             // store update locally as a merged task/status JSON string, without error info
-            guard let jsonData = try? JSONEncoder().encode(task),
-                  var jsonObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+            guard let jsonData = try? JSONEncoder().encode(TaskStatusUpdate(task: task, taskStatus: status))
             else {
                 os_log("Could not store status update locally", log: log, type: .debug)
                 return }
-            jsonObject["taskStatus"] = status.rawValue
-            storeLocally(prefsKey: Downloader.keyStatusUpdateMap, taskId: task.taskId, item: jsonObject)
+            storeLocally(prefsKey: BDPlugin.keyStatusUpdateMap, taskId: task.taskId, item: jsonData)
         }
     }
     if isFinalState(status: status) {
         // remove references to this task that are no longer needed
-        Downloader.progressInfo.removeValue(forKey: task.taskId)
-        Downloader.localResumeData.removeValue(forKey: task.taskId)
-        Downloader.remainingBytesToDownload.removeValue(forKey: task.taskId)
+        BDPlugin.progressInfo.removeValue(forKey: task.taskId)
+        BDPlugin.localResumeData.removeValue(forKey: task.taskId)
+        BDPlugin.remainingBytesToDownload.removeValue(forKey: task.taskId)
+        BDPlugin.tasksWithSuggestedFilename.removeValue(forKey: task.taskId)
+        BDPlugin.tasksWithContentLengthOverride.removeValue(forKey: task.taskId)
+        BDPlugin.responseBodyData.removeValue(forKey: task.taskId)
+        BDPlugin.taskIdsThatCanResume.remove(task.taskId)
+        BDPlugin.taskIdsProgrammaticallyCancelled.remove(task.taskId)
     }
 }
 
@@ -167,14 +366,11 @@ func processProgressUpdate(task: Task, progress: Double, expectedFileSize: Int64
     if providesProgressUpdates(task: task) {
         if (!postOnBackgroundChannel(method: "progressUpdate", task: task, arg: [progress, expectedFileSize, networkSpeed, Int(timeRemaining * 1000.0)] as [Any])) {
             // store update locally as a merged task/progress JSON string
-            guard let jsonData = try? JSONEncoder().encode(task),
-                  var jsonObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+            guard let jsonData = try? JSONEncoder().encode(TaskProgressUpdate(task: task, progress: progress, expectedFileSize: expectedFileSize))
             else {
                 os_log("Could not store progress update locally", log: log, type: .info)
                 return }
-            jsonObject["progress"] = progress
-            jsonObject["expectedFileSize"] = expectedFileSize
-            storeLocally(prefsKey: Downloader.keyProgressUpdateMap, taskId: task.taskId, item: jsonObject)
+            storeLocally(prefsKey: BDPlugin.keyProgressUpdateMap, taskId: task.taskId, item: jsonData)
         }
     }
 }
@@ -194,26 +390,21 @@ func processCanResume(task: Task, taskCanResume: Bool) {
 /// Sends the data via the background channel to Dart
 func processResumeData(task: Task, resumeData: Data) -> Bool {
     let resumeDataAsBase64String = resumeData.base64EncodedString()
-    Downloader.localResumeData[task.taskId] = resumeDataAsBase64String
+    BDPlugin.localResumeData[task.taskId] = resumeDataAsBase64String
     if !postOnBackgroundChannel(method: "resumeData", task: task, arg: resumeDataAsBase64String) {
         // store resume data locally
-        guard let jsonData = try? JSONEncoder().encode(task),
-              var taskJsonObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+        guard let jsonData = try? JSONEncoder().encode(ResumeData(task: task, data: resumeDataAsBase64String))
         else {
             os_log("Could not store resume data locally", log: log, type: .info)
             return false}
-        let resumeDataMap = [
-            "task": taskJsonObject,
-            "data": resumeDataAsBase64String
-        ] as [String : Any]
-        storeLocally(prefsKey: Downloader.keyResumeDataMap, taskId: task.taskId, item: resumeDataMap)
+        storeLocally(prefsKey: BDPlugin.keyResumeDataMap, taskId: task.taskId, item: jsonData)
     }
     return true
 }
 
 /// Return the background channel for cummincation to Dart side, or nil
 func getBackgroundChannel() -> FlutterMethodChannel? {
-    guard let channel = Downloader.backgroundChannel else {
+    guard let channel = BDPlugin.backgroundChannel else {
         os_log("Could not find background channel", log: log, type: .error)
         return nil
     }
@@ -224,7 +415,7 @@ func getBackgroundChannel() -> FlutterMethodChannel? {
 ///
 /// [arg] can be a list or a single variable
 func postOnBackgroundChannel(method: String, task:Task, arg: Any) -> Bool {
-    guard let channel = Downloader.backgroundChannel else {
+    guard let channel = BDPlugin.backgroundChannel else {
         os_log("Could not find background channel", log: log, type: .error)
         return false
     }
@@ -251,7 +442,7 @@ func postOnBackgroundChannel(method: String, task:Task, arg: Any) -> Bool {
         DispatchQueue.main.async {
             channel.invokeMethod(method, arguments: argsList, result: {(r: Any?) -> () in
                 success = !(r is FlutterError)
-                if Downloader.forceFailPostOnBackgroundChannel{
+                if BDPlugin.forceFailPostOnBackgroundChannel {
                     success = false
                 }
                 dispatchGroup.leave()
@@ -263,11 +454,13 @@ func postOnBackgroundChannel(method: String, task:Task, arg: Any) -> Bool {
 }
 
 /// Store the [item] in preferences under [prefsKey], keyed by [taskId]
+///
+/// [item] is a JsonEncoded Data object
 func storeLocally(prefsKey: String, taskId: String,
-                  item: [String:Any]) {
+                  item: Data) {
     let defaults = UserDefaults.standard
-    var map: [String:Any] = defaults.dictionary(forKey: prefsKey) ?? [:]
-    map[taskId] = item
+    var map = defaults.dictionary(forKey: prefsKey) ?? [:]
+    map[taskId] = String(data: item, encoding: .utf8)
     defaults.set(map, forKey: prefsKey)
 }
 
@@ -289,13 +482,18 @@ func taskFrom(jsonString: String) -> Task? {
 }
 
 /// Return the task corresponding to the URLSessionTask, or nil if it cannot be matched
+///
+/// If possible, the task returned contains the suggested filename
 func getTaskFrom(urlSessionTask: URLSessionTask) -> Task? {
     guard let jsonData = getTaskJsonStringFrom(urlSessionTask: urlSessionTask)?.data(using: .utf8)
     else {
         return nil
     }
     let decoder = JSONDecoder()
-    return try? decoder.decode(Task.self, from: jsonData)
+    if let task = try? decoder.decode(Task.self, from: jsonData) {
+        return BDPlugin.tasksWithSuggestedFilename[task.taskId] ?? task
+    }
+    return nil
 }
 
 /// Returns the taskJsonString contained in the urlSessionTask
@@ -335,27 +533,33 @@ func getNotificationConfigJsonStringFrom(urlSessionTask: URLSessionTask) -> Stri
 ///
 /// This is made up of the baseDirectory and the directory fields of the Task
 func directoryForTask(task: Task) throws ->  URL {
-    var dir: FileManager.SearchPathDirectory
-    switch task.baseDirectory {
-    case 0:
-        dir = .documentDirectory
-    case 1:
-        dir = .cachesDirectory
-    case 2:
-        dir = .applicationSupportDirectory
-    case 3:
-        dir = .libraryDirectory
-    default:
-        dir = .documentDirectory
+    let documentsURL: URL
+    if task.baseDirectory != BaseDirectory.root.rawValue {
+        var dir: FileManager.SearchPathDirectory
+        switch task.baseDirectory {
+            case 0:
+                dir = .documentDirectory
+            case 1:
+                dir = .cachesDirectory
+            case 2:
+                dir = .applicationSupportDirectory
+            case 3:
+                dir = .libraryDirectory
+            default:
+                dir = .documentDirectory
+        }
+        documentsURL =
+        try FileManager.default.url(for: dir,
+                                    in: .userDomainMask,
+                                    appropriateFor: nil,
+                                    create: false)
+    } else {
+        documentsURL = URL(fileURLWithPath: "/")
     }
-    let documentsURL =
-    try FileManager.default.url(for: dir,
-                                in: .userDomainMask,
-                                appropriateFor: nil,
-                                create: false)
     return task.directory.isEmpty
     ? documentsURL
     : documentsURL.appendingPathComponent(task.directory)
+    
 }
 
 /**
@@ -371,7 +575,7 @@ func insufficientSpace(contentLength: Int64) -> Bool {
     guard contentLength > 0 else {
         return false
     }
-    let checkValue = UserDefaults.standard.integer(forKey: Downloader.keyConfigCheckAvailableSpace)
+    let checkValue = UserDefaults.standard.integer(forKey: BDPlugin.keyConfigCheckAvailableSpace)
     guard
         // Check if the configCheckAvailableSpace preference is set and is positive
         checkValue > 0,
@@ -381,7 +585,14 @@ func insufficientSpace(contentLength: Int64) -> Bool {
         return false
     }
     // Calculate the total remaining bytes to download
-    let remainingBytesToDownload = Downloader.remainingBytesToDownload.values.reduce(0, +)
+    let remainingBytesToDownload = BDPlugin.remainingBytesToDownload.values.reduce(0, +)
     // Return true if there is insufficient space to store the file
     return available - (remainingBytesToDownload + contentLength) < checkValue << 20
+}
+
+/// Post result [value] on FlutterResult completer
+func postResult(result: FlutterResult?, value: Any) {
+    if result != nil {
+        result!(value)
+    }
 }

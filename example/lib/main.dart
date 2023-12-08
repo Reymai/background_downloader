@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:background_downloader/background_downloader.dart';
@@ -43,8 +44,8 @@ class _MyAppState extends State<MyApp> {
     // storage backing that implements the [PersistentStorage] interface. You
     // must initialize the FileDownloader by passing that alternative storage
     // object on the first call to FileDownloader.
-    // As an example, this example app has implemented a backing using
-    // the sqflite package (works for Android/iOS only).
+    // For example, add a dependency for background_downloader_sql to
+    // pubspec.yaml which adds [SqlitePersistentStorage].
     // To try that SQLite version, uncomment the following line, which
     // will initialize the downloader with the SQLite storage solution.
     // FileDownloader(persistentStorage: SqlitePersistentStorage());
@@ -69,12 +70,21 @@ class _MyAppState extends State<MyApp> {
             running: const TaskNotification('Download {filename}',
                 'File: {filename} - {progress} - speed {networkSpeed} and {timeRemaining} remaining'),
             complete: const TaskNotification(
-                'Download {filename}', 'Download complete'),
+                '{displayName} download {filename}', 'Download complete'),
             error: const TaskNotification(
                 'Download {filename}', 'Download failed'),
             paused: const TaskNotification(
                 'Download {filename}', 'Paused with metadata {metadata}'),
             progressBar: true)
+        .configureNotificationForGroup('bunch',
+            running: const TaskNotification(
+                '{numFinished} out of {numTotal}', 'Progress = {progress}'),
+            complete:
+                const TaskNotification("Done!", "Loaded {numTotal} files"),
+            error: const TaskNotification(
+                'Error', '{numFailed}/{numTotal} failed'),
+            progressBar: false,
+            groupNotificationId: 'notGroup')
         .configureNotification(
             // for the 'Download & Open' dog picture
             // which uses 'download' which is not the .defaultGroup
@@ -113,6 +123,15 @@ class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      theme: ThemeData(
+        useMaterial3: true,
+
+        // Define the default brightness and colors.
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.purple,
+          brightness: Brightness.light,
+        ),
+      ),
       home: Scaffold(
           appBar: AppBar(
             title: const Text('background_downloader example app'),
@@ -145,10 +164,6 @@ class _MyAppState extends State<MyApp> {
                   onPressed: processButtonPress,
                   child: Text(
                     buttonTexts[buttonState.index],
-                    style: Theme.of(context)
-                        .textTheme
-                        .headlineMedium
-                        ?.copyWith(color: Colors.white),
                   ),
                 )),
                 Padding(
@@ -163,45 +178,30 @@ class _MyAppState extends State<MyApp> {
                 const Divider(
                   height: 30,
                   thickness: 5,
-                  color: Colors.grey,
+                  color: Colors.blueGrey,
                 ),
                 Center(
                     child: ElevatedButton(
                         onPressed:
                             loadAndOpenInProgress ? null : processLoadAndOpen,
                         child: Text(
-                          'Load & Open',
-                          style: Theme.of(context)
-                              .textTheme
-                              .headlineMedium
-                              ?.copyWith(color: Colors.white),
+                          Platform.isIOS ? 'Load, open and add' : 'Load & Open',
                         ))),
                 Center(
                     child: Text(
                   loadAndOpenInProgress ? 'Busy' : '',
-                  style: Theme.of(context).textTheme.headlineSmall,
                 )),
                 const Divider(
                   height: 30,
                   thickness: 5,
-                  color: Colors.grey,
+                  color: Colors.blueGrey,
                 ),
                 Center(
                     child: ElevatedButton(
                         onPressed:
                             loadABunchInProgress ? null : processLoadABunch,
-                        child: Text(
-                          'Load a bunch',
-                          style: Theme.of(context)
-                              .textTheme
-                              .headlineMedium
-                              ?.copyWith(color: Colors.white),
-                        ))),
-                Center(
-                    child: Text(
-                  loadABunchInProgress ? 'Enqueueing' : '',
-                  style: Theme.of(context).textTheme.headlineSmall,
-                )),
+                        child: const Text('Load a bunch'))),
+                Center(child: Text(loadABunchInProgress ? 'Enqueueing' : '')),
               ],
             ),
           )),
@@ -219,6 +219,7 @@ class _MyAppState extends State<MyApp> {
     switch (buttonState) {
       case ButtonState.download:
         // start download
+        await getPermission(PermissionType.notifications);
         backgroundDownloadTask = DownloadTask(
             url: downloadWithError
                 ? 'https://avmaps-dot-bbflightserver-hrd.appspot.com/public/get_current_app_data' // returns 403 status code
@@ -227,8 +228,10 @@ class _MyAppState extends State<MyApp> {
             directory: 'my/directory',
             baseDirectory: BaseDirectory.downloads,
             updates: Updates.statusAndProgress,
+            retries: 3,
             allowPause: true,
-            metaData: '<example metaData>');
+            metaData: '<example metaData>',
+            displayName: 'My display name');
         await FileDownloader().enqueue(backgroundDownloadTask!);
         break;
       case ButtonState.cancel:
@@ -263,6 +266,7 @@ class _MyAppState extends State<MyApp> {
   /// Loads a JPG of a dog and launches viewer using [openFile]
   Future<void> processLoadAndOpen() async {
     if (!loadAndOpenInProgress) {
+      await getPermission(PermissionType.notifications);
       var task = DownloadTask(
           url:
               'https://i2.wp.com/www.skiptomylou.org/wp-content/uploads/2019/06/dog-drawing.jpg',
@@ -273,6 +277,33 @@ class _MyAppState extends State<MyApp> {
       });
       await FileDownloader().download(task);
       await FileDownloader().openFile(task: task);
+      if (Platform.isIOS) {
+        // add to photos library and print path
+        // If you need the path, ask full permissions beforehand by calling
+        var auth = await FileDownloader()
+            .permissions
+            .status(PermissionType.iosChangePhotoLibrary);
+        if (auth != PermissionStatus.granted) {
+          auth = await FileDownloader()
+              .permissions
+              .request(PermissionType.iosChangePhotoLibrary);
+        }
+        if (auth == PermissionStatus.granted) {
+          final identifier = await FileDownloader()
+              .moveToSharedStorage(task, SharedStorage.images);
+          if (identifier != null) {
+            final path = await FileDownloader()
+                .pathInSharedStorage(identifier, SharedStorage.images);
+            debugPrint(
+                'iOS path to dog picture in Photos Library = ${path ?? "permission denied"}');
+          } else {
+            debugPrint(
+                'Could not add file to Photos Library, likely because permission denied');
+          }
+        } else {
+          debugPrint('iOS Photo Library permission not granted');
+        }
+      }
       setState(() {
         loadAndOpenInProgress = false;
       });
@@ -284,17 +315,33 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         loadABunchInProgress = true;
       });
+      await getPermission(PermissionType.notifications);
       for (var i = 0; i < 5; i++) {
         await FileDownloader().enqueue(DownloadTask(
             url:
                 'https://storage.googleapis.com/approachcharts/test/5MB-test.ZIP',
             filename: 'File_${Random().nextInt(1000)}',
+            group: 'bunch',
             updates: Updates.progress)); // must provide progress updates!
-        await Future.delayed(const Duration(milliseconds: 100));
+        await Future.delayed(const Duration(milliseconds: 500));
       }
       setState(() {
         loadABunchInProgress = false;
       });
+    }
+  }
+
+  /// Attempt to get permissions if not already granted
+  Future<void> getPermission(PermissionType permissionType) async {
+    var status = await FileDownloader().permissions.status(permissionType);
+    if (status != PermissionStatus.granted) {
+      if (await FileDownloader()
+          .permissions
+          .shouldShowRationale(permissionType)) {
+        debugPrint('Showing some rationale');
+      }
+      status = await FileDownloader().permissions.request(permissionType);
+      debugPrint('Permission for $permissionType was $status');
     }
   }
 }

@@ -1,3 +1,263 @@
+## 8.0.0
+
+### Summary of changes:
+* Permissions must now be explicitly checked and requested to improve user experience and give control to developer
+* Add images and video to iOS Photo Library when using `SharedStorage.images` or `SharedStorage.video`
+* `SqlitePersistentStorage` backing database moved to separate package `background_downloader_sql` to reduce app size for default
+* Add notification for groups of downloads
+* Add `BaseDirectory.root` to allow absolute file path (use with care!)
+* Add fields `mimeType` and `charSet` to `TaskStatusUpdate`
+* Add `Request.cookieHeader` to parse 'Set-Cookie' response header
+* Add `platformVersion` method
+* Add `ready` getter to wait for initialization if needed
+* Bug fixes and other improvements
+
+### BREAKING: Permissions
+
+Permissions are no longer automatically requested. You need to explicitly check, and if necessary ask for permissions ahead of calling methods that use them.
+
+User permissions may be needed to display notifications, to move files to shared storage (on Android) and to add images or video to the iOS Photo Library. These permissions should be checked and if needed requested before executing those operations.
+
+You can use a package like [permission_handler](https://pub.dev/packages/permission_handler), or use the `FileDownloader().permissions` object, which has three methods:
+* `status`: returns a `PermissionsStatus`. On Android this is either `granted` or `denied`. If you have not asked for permission yet, then Android returns `denied` and iOS returns `.undetermined`. iOS can also return `.partial`
+* `request`: to request the actual permission. Only do this if you have confirmed that the permission is not already `granted`
+* `shouldShowRationale`: for Android only, if `true` you should show a UI element (e.g. a dialog) to explain to the user why this permission is necessary
+
+All three methods take one `PermissionType` parameter:
+* `notifications`, to display notifications
+* `androidSharedStorage`, to move files to external storage on Android, before API 29
+* `iosAddToPhotoLibrary`, to move files to `SharedStorage.images` or `SharedStorage.video` on iOS, as this adds those files to the Photo Library
+* `iosChangePhotoLibrary`, to access the path to files moved to the Photos Library
+
+For example, to request permissions for notifications:
+```dart
+final permissionType = PermissionType.notifications;
+var status = await FileDownloader().permissions.status(permissionType);
+if (status != PermissionStatus.granted) {
+if (await FileDownloader().permissions.shouldShowRationale(permissionType)) {
+await showRationaleDialog(permissionType); // Show a dialog with rationale
+}
+status = await FileDownloader().permissions.request(permissionType);
+debugPrint('Permission for $permissionType was $status');
+}
+```
+
+The downloader will check permission status before each action, e.g. will not show notifications unless permissions for notifications have been granted.
+
+Note that permissions are very platform and version dependent, e.g. notification permissions on Android are only required as of API 33, and iOS 14 introduced new Photo Library permissions. If you want to get into details, you can determine the platform version you're running by calling `await FileDownloader().platformVersion()`.
+
+### BREAKING: Use iOS Photos Library for .video and .images SharedStorage destinations
+
+Previously, .images and .video destinations were 'faked' on iOS. With this change, when calling `moveToSharedStorage`, the file is added to the Photos Library (provided the user grants that permission).
+
+For `.images` and `.video` SharedStorage destinations, you need user permission to add to the Photos Library, which requires you to set the `NSPhotoLibraryAddUsageDescription` key in `Info.plist`. The returned String is _not_ a `filePath`, but a unique identifier. If you only want to add the file to the Photos Library you can ignore this identifier. If you want to actually get access to the file (and `filePath`) in the Photos Library, then the user needs to grant an additional 'modify' permission, which requires you to set the `NSPhotoLibraryUsageDescription` in `Info.plist`. To get the actual `filePath`, call `pathInSharedStorage` and pass the identifier obtained via the call to `moveToSharedStorage` as the `filePath` parameter:
+```dart
+// assume we have permission
+final identifier = await FileDownloader().moveToSharedStorage(task, SharedStorage.images);
+if (identifier != null) {
+  final path = await FileDownloader().pathInSharedStorage(identifier, SharedStorage.images);
+  debugPrint('iOS path to dog picture in Photos Library = ${path ?? "permission denied"}');
+} else {
+  debugPrint('Could not add file to Photos Library, likely because permission denied');
+}
+```
+The reason for this two-step approach is that typically you only want to add to the library (requires `PermissionType.iosAddToPhotoLibrary`), which does not require the user to give read/write access to their entire photos library (`PermissionType.iosChangePhotoLibrary`, required to get the `filePath`).
+
+### BREAKING: PersistentStorage and PersistentStorageMigrator
+
+If you use the default `PersistentStorage` then nothing changes. Otherwise:
+* `SqlitePersistentStorage` moved to a separate package, and the migrator used is `SqlPersistentStorageMigrator`
+* `PersistentStorage` is now an interface, not a class, and `LocalStorePersistentStorage` is the default implementation
+* `PersistentStorageMigrator` is now an interface, and `BasePersistentStorageMigrator` is a basic implementation that can be extended to add migration options (as is done in `SqlPersistentStorageMigrator`)
+
+Add `background_downloader_sql` to your dependencies in pubspec.yaml to get `SqlitePersistentStorage` and SQLite related migration options back.
+
+The reason for this change is that the `sqflite` dependency adds significant size to apps, even if they do not use the SQLite functionality.
+
+### Introduce groupNotification
+
+If you download or upload multiple files simultaneously, you may not want a notification for every task, but one notification representing the group of tasks.  To do this, set the `groupNotificationId` field in a `notificationConfig` and use that configuration for all tasks in this group. It is easiest to combine this with the `group` field of the task, e.g.:
+```dart
+FileDownloader.configureNotificationForGroup('bunchOfFiles',
+            running: const TaskNotification(
+                '{numFinished} out of {numTotal}', 'Progress = {progress}'),
+            complete:
+                const TaskNotification('Done!', 'Loaded {numTotal} files'),
+            error: const TaskNotification(
+                'Error', '{numFailed}/{numTotal} failed'),
+            progressBar: true,
+            groupNotificationId: 'myGroupNotification');
+            
+// start every task like this
+await FileDownloader().enqueue(DownloadTask(
+            url: 'https://your_url.com',
+            filename: 'your_filename',
+            group: 'bunchOfFiles'));
+```
+
+All tasks in group `bunchOfFiles` will now use the notification group configuration with ID `myNotificationGroup`.
+
+### Add `BaseDirectory.root`
+
+You can now pass an absolute path to the downloader by using `BaseDirectory.root` combined with the path in `directory`. This allows you to reach any file destination on your platform. However, be careful: the reason you should not normally do this (and use e.g. `BaseDirectory.applicationDocuments` instead) is that the location of the app's documents directory may change between application starts (on iOS, and on Android in some cases), and may therefore fail for downloads that complete while the app is suspended.  You should therefore never store permanently, or hard-code, an absolute path, unless you are absolutely sure that that path is 'stable'.
+
+### Add fields `mimeType` and `charSet` to `TaskStatusUpdate`
+
+If the server provides this information via the `Content-Type` header then these fields will be non-null only for final states.
+
+### Add Request.cookieHeader to parse 'Set-Cookie' response header
+
+Servers may ask you to set a cookie (via the 'Set-Cookie' header in the response), to be passed along to the next request (in the 'Cookie' header).
+This may be needed for authentication, or for session state.
+
+The method `Request.cookieHeader` makes it easy to insert cookies in a request. The first argument `cookies` is either a `http.Response` object (as returned by the `FileDownloader().request` method), a `List<Cookie>`, or a String value from a 'Set-Cookie' header. It returns a `{'Cookie': '...'}` header that can be added to the next request.
+The second argument is the `url` you intend to use the cookies with. This is needed to filter the appropriate cookies based on domain and path.
+
+For example:
+```dart
+final loginResponse = await FileDownloader()
+   .request(Request(url: 'https://server.com/login', headers: {'Auth': 'Token'}));
+const downloadUrl = 'https://server.com/download';
+// add the cookies from the response to the task
+final task = DownloadTask(url: downloadUrl, headers: {
+  'Auth': 'Token',
+  ...Request.cookieHeader(loginResponse, downloadUrl) // inserts the 'Cookie' header
+});
+```
+
+
+### Add platformVersion method
+Return the platform version as a String:
+* On Android this is the API integer, e.g. "33"
+* On iOS this is the iOS version, e.g. "16.1"
+* On desktop this is a description of the OS version, not parsable
+
+### Add `ready`
+
+If initializing a non-default `PersistentStorage` such as `SqlitePersistentStorage` you may need to wait for database initialization and perhaps migration to complete before using the downloader. Call `await FileDowloader().ready` before the first call that involves the persistent storage. Because initialization is often followed immediately by the `trackTasks` call, that call waits for `ready`, so this is valid:
+```dart
+await FileDownloader(persistentStorage: SqlitePersistentStorage()).trackTasks();
+```
+
+### Remove `awaitGroup`
+* Removed all references to `awaitGroup` as the logic for the convenience methods such as `download` has changed
+* Removed all references to `modifiedTasks` in `PersistentStorage` interface
+* If you use a convenience function, your task _must_ generate status updates (by setting the `updates` field to `Updates.status` - the default - or `Updates.statusAndProgress`)
+* If you use a convenience function and specify a progress callback, your task _must_ also generate status updates (by setting the `updates` field to `Updates.statusAndProgress`)
+
+### Bug fixes and other improvements
+* Fixes Pause notification issue on iOS
+* Fixes issue with priority for multi-part file uploads
+* Fixes issue #194: remove notification when canceling a paused task
+* Fixes issue #200: prefer UTF-8 filename in Content-Disposition parse
+* Fixes issue #202: add minimum deployment target to PodSpec on iOS
+* Strip leading path separator from Task.directory instead of throwing an exception
+* Refactors code to improve readability
+
+
+## 7.12.3
+
+Issue #189 related to resume on Android versions prior to S, and to expediting a task prior to S
+
+See https://stackoverflow.com/a/68468786/4172761
+
+Fixes issue with parsing priority from JSON
+Fixes issue with setting expedited for Android versions prior to S. This effectively ignores priority (expedited) scheduling for tasks prior to Android S and defaults to normal. 
+
+## 7.12.2
+
+Minor improvements to `TaskQueue` and `MemoryTaskQueue`
+
+## 7.12.1
+
+Bug fix for web compilation
+
+## 7.12.0
+
+### Task priority levels
+
+The `Task.priority` field must be 0 <= priority <= 10 with 0 being the highest priority, and defaults to 5. On Desktop and iOS all priority levels are supported. On Android, priority levels <5 are handled as 'expedited', and >=5 is handled as a normal task.
+
+### Task queues
+
+Once you `enqueue` a task with the `FileDownloader` it is added to an internal queue that is managed by the native platform you're running on (e.g. Android). Once enqueued, you have limited control over the execution order, the number of tasks running in parallel, etc, because all that is managed by the platform.  If you want more control over the queue, you need to add a `TaskQueue`.
+
+The `MemoryTaskQueue` bundled with the `background_downloader` allows:
+* pacing the rate of enqueueing tasks, based on `minInterval`, to avoid 'choking' the FileDownloader when adding a large number of tasks
+* managing task priorities while waiting in the queue, such that higher priority tasks are enqueued before lower priority ones
+* managing the total number of tasks running concurrently, by setting `maxConcurrent`
+* managing the number of tasks that talk to the same host concurrently, by setting `maxConcurrentByHost`
+* managing the number of tasks running that are in the same `Task.group`, by setting `maxConcurrentByGroup`
+
+A `TaskQueue` conceptually sits 'before' the FileDownloader's queue. To use it, add it to the `FileDownloader` and instead of enqueuing tasks with the `FileDownloader`, you now `add` tasks to the queue:
+```dart
+final tq = MemoryTaskQueue();
+tq.maxConcurrent = 5; // no more than 5 tasks active at any one time
+tq.maxConcurrentByHost = 2; // no more than two tasks talking to the same host at the same time
+tq.maxConcurrentByGroup = 3; // no more than three tasks from the same group active at the same time
+FileDownloader().add(tq); // 'connects' the TaskQueue to the FileDownloader
+FileDownloader().updates.listen((update) { // listen to updates as per usual
+  print('Received update for ${update.task.taskId}: $update')
+});
+for (var n = 0; n < 100; n++) {
+  task = DownloadTask(url: workingUrl, metData: 'task #$n'); // define task
+  tq.add(task); // add to queue. The queue makes the FileDownloader().enqueue call
+}
+```
+
+Because it is possible that an error occurs when the taskQueue eventually actually enqueues the task with the FileDownloader, you can listen to the `enqueueErrors` stream for tasks that failed to enqueue.
+
+The default `TaskQueue` is the `MemoryTaskQueue` which, as the  name suggests, keeps everything in memory. This is fine for most situations, but be aware that the queue may get dropped if the OS aggressively moves the app to the background. Tasks still waiting in the queue will not be enqueued, and will therefore be lost. If you want a `TaskQueue` with more persistence, subclass the `MemoryTaskQueue` and add persistence.
+In addition, if your app is supended by the OS due to resource constraints, tasks waiting in the queue will not be enqueued to the native platform and will not run in the background. TaskQueues are therefore best for situations where you expect the queue to be emptied while the app is still in the foreground.
+
+
+## 7.11.1
+
+Fix #164 for progress updates for uploads.
+
+## 7.11.0
+
+### Android external storage
+Add configuration for Android to use external storage instead of internal storage. Either your app runs in default (internal storage) mode, or in external storage. You cannot switch between internal and external, as the directory structure that - for example - `BaseDirectory.applicationDocuments` refers to is different in each mode. See the [configuration document](https://github.com/781flyingdutchman/background_downloader/blob/main/CONFIG.md) for important details and limitations
+
+Use `(Config.useExternalStorage, String whenToUse)` with values 'never' or 'always'. Default is `Config.never`.
+
+### Server suggested filename
+If you want the filename to be provided by the server (instead of assigning a value to `filename` yourself), you now have two options. The first is to create a `DownloadTask` that pings the server to determine the suggested filename:
+```dart
+final task = await DownloadTask(url: 'https://google.com')
+        .withSuggestedFilename(unique: true);
+```
+The method `withSuggestedFilename` returns a copy of the task it is called on, with the `filename` field modified based on the filename suggested by the server, or the last path segment of the URL, or unchanged if neither is feasible (e.g. due to a lack of connection). If `unique` is true, the filename will be modified such that it does not conflict with an existing filename by adding a sequence. For example "file.txt" would become "file (1).txt". You can now also supply a `taskWithFilenameBuilder` to suggest the filename yourself, based on response headers.
+
+The second approach is to set the `filename` field of the `DownloadTask` to `DownloadTask.suggestedFilename`, to indicate that you would like the server to suggest the name. In this case, you will receive the name via the task's status and/or progress updates, so you have to be careful _not_ to use the original task's filename, as that will still be `DownloadTask.suggestedFilename`. For example:
+```dart
+final task = await DownloadTask(url: 'https://google.com', filename: DownloadTask.suggestedFilename);
+final result = await FileDownloader().download(task);
+print('Suggested filename=${result.task.filename}'); // note we don't use 'task', but 'result.task'
+print('Wrong use filename=${task.filename}'); // this will print '?' as 'task' hasn't changed
+```
+
+### Set content length if not provided by server
+
+To provide progress updates (as a percentage of total file size) the downloader needs to know the size of the file when starting the download. Most servers provide this in the "Content-Length" header of their response. If the server does not provide the file size, yet you know the file size (e.g. because you have stored the file on the server yourself), then you can let the downloader know by providing a `{'Range': 'bytes=0-999'}` or a `{'Known-Content-Length': '1000'}` header to the task's `header` field. Both examples are for a content length of 1000 bytes.  The downloader will assume this content length when calculating progress.
+
+### Bug fix
+
+Partial Downloads, using a Range header, can now be properly paused on all platforms.
+
+## 7.10.1
+
+Add `displayName` field to `Task` that can be used to store and dsipay a 'human readable' description of the task. It can be displayed in a notification using {displayName}.
+
+Bug fix for regression in compiling for Web platform (through stubbing - no actual web functionality).
+
+## 7.10.0
+
+Add `ParallelDownloadTask`. Some servers may offer an option to download part of the same file from multiple URLs or have multiple parallel downloads of part of a large file using a single URL. This can speed up the download of large files.  To do this, create a `ParallelDownloadTask` instead of a regular `DownloadTask` and specify `chunks` (the number of pieces you want to break the file into, i.e. the number of downloads that will happen in parallel) and `urls` (as a list of URLs, or just one). For example, if you specify 4 chunks and 2 URLs, then the download will be broken into 8 pieces, four each for each URL.
+
+Note that the implementation of this feature creates a regular `DownloadTask` for each chunk, with the group name 'chunk' which is now a reserved group. You will not get updates for this group, but you will get normal updates (status and/or progress) for the `ParallelDownloadTask`.
+
 ## 7.9.4
 
 Enable compile for Web platform (through stubbing - no actual web functionality).
@@ -28,7 +288,7 @@ Tasks can only resume if the ETag header provided by the server is strong, and e
 
 ### Configuration
 
-Add configuration of the downloader for several aspect:
+Add configuration of the downloader for several aspects:
 * Running tasks in 'foreground mode' on Android to allow longer runs and prevent the OS killing some tasks when the app is in the background
 * Setting the request timeout value and, for iOS only, the 'resourceTimeout'
 * Checking available space before attempting a download

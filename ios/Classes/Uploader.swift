@@ -25,15 +25,12 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
     var totalBytesWritten: Int64 = 0
     static let boundary = "-----background_downloader-akjhfw281onqciyhnIk"
     let lineFeed = "\r\n"
-    
     let asciiOnly = try! NSRegularExpression(pattern: "^[\\x00-\\x7F]+$")
     let newlineRegExp = try! NSRegularExpression(pattern: "\r\n|\r|\n")
+    let bufferSize = 2 << 13
     
     
-    let bufferSize = 8192
-    
-    
-    /// Initialize an Uploader for this Task and urlSessionTaskIdentifies
+    /// Initialize an Uploader for this Task
     init(task: Task) {
         self.task = task
         outputFilename = NSUUID().uuidString
@@ -66,16 +63,16 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
         let terminator = "\(lineFeed)--\(Uploader.boundary)--\(lineFeed)" // after last file
         guard let filePath = getFilePath(for: task) else {return false}
         let filesData = filePath.isEmpty
-            ? extractFilesData(task: task) // MultiUpload case
-            : [(task.fileField!, filePath, task.mimeType!)] // one file Upload case
+        ? extractFilesData(task: task) // MultiUpload case
+        : [(task.fileField!, filePath, task.mimeType!)] // one file Upload case
         for (fileField, path, mimeType) in filesData {
             if !FileManager.default.fileExists(atPath: path) {
                 os_log("File to upload does not exist at %@", log: log, type: .error, path)
                 return false
             }
             let contentDispositionString =
-                "Content-Disposition: form-data; name=\"\(browserEncode(fileField))\"; "
-                + "filename=\"\(browserEncode(path.components(separatedBy: "/").last!))\"\(lineFeed)"
+            "Content-Disposition: form-data; name=\"\(browserEncode(fileField))\"; "
+            + "filename=\"\(browserEncode(path.components(separatedBy: "/").last!))\"\(lineFeed)"
             let contentTypeString = "Content-Type: \(mimeType)\(lineFeed)\(lineFeed)"
             let fileUrl = URL(fileURLWithPath: path)
             guard let inputStream = InputStream(url: fileUrl) else {

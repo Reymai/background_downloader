@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import 'base_downloader.dart';
 import 'models.dart';
+import 'task.dart';
 
 /// This is a non-functional stub
 ///
@@ -57,12 +58,18 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
-  Future<Map<String, dynamic>> popUndeliveredData(Undelivered dataType) {
+  Future<Map<String, String>> popUndeliveredData(Undelivered dataType) {
     throw UnimplementedError();
   }
 
   @override
   Future<void> setForceFailPostOnBackgroundChannel(bool value) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<String> testSuggestedFilename(
+      DownloadTask task, String contentDisposition) {
     throw UnimplementedError();
   }
 }
