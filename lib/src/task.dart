@@ -349,13 +349,16 @@ sealed class Task extends Request implements Comparable {
             'Android external storage is not available');
       }
     }
-    final Directory baseDir =
+    final Directory? baseDir =
         switch ((baseDirectory, Task.useExternalStorage)) {
       (BaseDirectory.applicationDocuments, false) =>
         await getApplicationDocumentsDirectory(),
       (BaseDirectory.temporary, false) => await getTemporaryDirectory(),
       (BaseDirectory.applicationSupport, false) =>
         await getApplicationSupportDirectory(),
+      (BaseDirectory.downloads, false) when Platform.isIOS =>
+        await getApplicationSupportDirectory(),
+      (BaseDirectory.downloads, false) => await getDownloadsDirectory(),
       (BaseDirectory.applicationLibrary, false)
           when Platform.isMacOS || Platform.isIOS =>
         await getLibraryDirectory(),
@@ -368,8 +371,14 @@ sealed class Task extends Request implements Comparable {
       (BaseDirectory.applicationSupport, true) =>
         Directory(path.join(externalStorageDirectory!.path, 'Support')),
       (BaseDirectory.applicationLibrary, true) =>
-        Directory(path.join(externalStorageDirectory!.path, 'Library'))
+        Directory(path.join(externalStorageDirectory!.path, 'Library')),
+      (BaseDirectory.downloads, true) =>
+        Directory(path.join(externalStorageDirectory!.path, 'Downloads')),
     };
+
+    if (baseDir == null || !baseDir.existsSync()) {
+      throw const FileSystemException('Base directory does not exist');
+    }
     return path.join(baseDir.path, directory, withFilename ?? filename);
   }
 
